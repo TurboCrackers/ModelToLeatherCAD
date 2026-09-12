@@ -449,9 +449,9 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
   void len2;
 
   // ---- stitch holes: one arc-length list per seam, shared by both sides.
-  // Where two seams meet at a corner the rows end on a shared corner hole (inset from both
-  // edges), so the pitch is stretched slightly to land there; otherwise rows stop half a
-  // pitch plus the inset from the seam end so neighbouring rows do not collide.
+  // Hand-stitching practice: rows keep a nominal pitch and stop short of corners. Where a seam
+  // meets another seam at a corner the last hole sits one pitch plus the edge margin from the
+  // corner (the corner itself is left clear); at a raw edge half a pitch plus the margin.
   const cornerMargin = (sr: SideRun, atRunStart: boolean): number => {
     const seam = seams[sr.seamId];
     const inset = seam.insetMm;
@@ -459,19 +459,15 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     const n = runs.length;
     const me = runs[sr.runIdxInLoop];
     const other = runs[(sr.runIdxInLoop + (atRunStart ? -1 : 1) + n) % n];
-    const fallback = Math.max(seam.pitch * 0.6, inset + seam.pitch * 0.5);
-    if (!me.pts2 || !other.pts2 || other.seamId === undefined || other.seamId < 0 || other === me) return fallback;
+    const rawEnd = Math.max(seam.pitch * 0.6, inset + seam.pitch * 0.5);
+    if (!me.pts2 || !other.pts2 || other.seamId === undefined || other.seamId < 0 || other === me) return rawEnd;
     const a = atRunStart ? other.pts2 : me.pts2, b = atRunStart ? me.pts2 : other.pts2;
-    if (a.length < 2 || b.length < 2) return fallback;
+    if (a.length < 2 || b.length < 2) return rawEnd;
     const d1: V2 = [a[a.length - 1][0] - a[a.length - 2][0], a[a.length - 1][1] - a[a.length - 2][1]];
     const d2: V2 = [b[1][0] - b[0][0], b[1][1] - b[0][1]];
-    const turn = Math.atan2(d1[0] * d2[1] - d1[1] * d2[0], d1[0] * d2[0] + d1[1] * d2[1]); // + = left = convex corner
-    const interior = Math.PI - turn;
-    if (interior <= 0.05 || interior >= Math.PI - 0.05) return fallback; // straight continuation: no corner
-    const otherInset = seams[other.seamId].insetMm;
-    // distance along this seam from the corner to the point that is `inset` from this edge and `otherInset` from the other
-    const m = otherInset / Math.sin(interior) + inset / Math.tan(interior);
-    return Math.min(Math.max(m, 0.4 * inset, 0.8), inset + seam.pitch);
+    const turn = Math.abs(Math.atan2(d1[0] * d2[1] - d1[1] * d2[0], d1[0] * d2[0] + d1[1] * d2[1]));
+    if (turn < 0.35) return rawEnd; // straight continuation into the next seam: no corner
+    return Math.max(inset, seams[other.seamId].insetMm) + seam.pitch;
   };
   for (const seam of seams) {
     const sides = sideRuns.filter((sr) => sr.seamId === seam.id);
@@ -487,11 +483,12 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     const usable = L - mStart - mEnd;
     seam.holeArc.length = 0;
     if (L >= 3 * spec.holeDiameterMm) {
-      if (usable < 0.5 * seam.pitch) seam.holeArc.push(L / 2);
+      if (usable < 0) seam.holeArc.push(L / 2);
       else {
-        const n = Math.max(2, Math.round(usable / seam.pitch) + 1);
-        const pStep = usable / (n - 1);
-        for (let k = 0; k < n; k++) seam.holeArc.push(mStart + k * pStep);
+        // nominal pitch, row centred between the two margins
+        const n = Math.floor(usable / seam.pitch + 1e-6) + 1;
+        const s0 = mStart + (usable - (n - 1) * seam.pitch) / 2;
+        for (let k = 0; k < n; k++) seam.holeArc.push(s0 + k * seam.pitch);
       }
     }
     const key = seamKey(seam.origEdges);
