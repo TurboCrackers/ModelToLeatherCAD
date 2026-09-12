@@ -67,6 +67,9 @@ export interface PieceRun {
 
 export interface Hole {
   seamId: number;
+  /** index along the seam's full hole list (stable id for deletions) */
+  index: number;
+  side: 'A' | 'B';
   /** piece-local 2D */
   p: V2;
   /** 3D position on the displayed model surface */
@@ -108,6 +111,8 @@ export interface PatternOptions {
   rawEdgeAllowanceMm: number;
   /** smooth the zig-zag mesh-edge seams into curves with corners where needed */
   smoothCutLines: boolean;
+  /** holes removed by the user, as `${seamKey}:${index}` */
+  deletedHoles?: Set<string>;
 }
 
 export interface PatternSet {
@@ -385,14 +390,16 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
           pts3 = isA ? s3l : s3l.slice().reverse();
           // holes for this side, positioned by arc fraction of the shared smoothed chain
           const L2 = polylineLength(s2), L3 = sm.length || 1;
-          for (const sArc of sm.holeArc) {
+          const key = seamKey(sm.origEdges);
+          sm.holeArc.forEach((sArc, k) => {
+            if (opts.deletedHoles?.has(`${key}:${k}`)) return;
             const { p, dir } = pointAtArc(s2, (sArc / L3) * L2);
             const left = perp2(dir);
             const inward = isA ? left : scale2(left, -1);
             const p2 = add2(p, scale2(inward, sm.insetMm));
             // 3D marker: map the 2D hole back onto the surface through the flattening (filled in below)
-            pc.holes.push({ seamId, p: p2, p3: [0, 0, 0] });
-          }
+            pc.holes.push({ seamId, index: k, side: isA ? 'A' : 'B', p: p2, p3: [0, 0, 0] });
+          });
           // label and notches
           const mid = pointAtArc(s2, L2 / 2);
           const midInward = isA ? perp2(mid.dir) : scale2(perp2(mid.dir), -1);

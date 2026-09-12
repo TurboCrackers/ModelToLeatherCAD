@@ -12,6 +12,9 @@ function check(model: ReturnType<typeof makeBox>, familyId: string, tMm: number)
   // every seam has holes on both sides with the same count
   for (const seam of pattern.seams) {
     const a = pattern.pieces[seam.sideA.patchId].holes.filter((h) => h.seamId === seam.id).length;
+    const sidesA = pattern.pieces[seam.sideA.patchId].holes.filter((h) => h.seamId === seam.id && h.side === 'A').length;
+    const sidesB = pattern.pieces[seam.sideB.patchId].holes.filter((h) => h.seamId === seam.id && h.side === 'B').length;
+    expect(sidesA).toBe(sidesB);
     const b = pattern.pieces[seam.sideB.patchId].holes.filter((h) => h.seamId === seam.id).length;
     if (seam.isDart || seam.isClosure) expect(a).toBe(2 * seam.holeArc.length);
     else { expect(a).toBe(seam.holeArc.length); expect(b).toBe(seam.holeArc.length); }

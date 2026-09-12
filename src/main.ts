@@ -14,7 +14,7 @@ import { exportSvg } from './export/svg';
 import { exportPdf, PaperSize } from './export/pdf';
 import { Viewer, PickInfo, patchColor } from './viewer/scene';
 
-type Tool = 'select' | 'cut' | 'move' | 'points' | 'join' | 'seamtype';
+type Tool = 'select' | 'cut' | 'move' | 'points' | 'holes' | 'join' | 'seamtype';
 const UNIT_SCALE: Record<string, number> = { mm: 1, cm: 10, m: 1000, in: 25.4 };
 
 class App {
@@ -117,7 +117,7 @@ class App {
     const goreAxis = el('select', { onChange: () => { this.settings.goreAxis = goreAxis.value as any; this.scheduleRecompute('full'); } }, option('auto', 'Auto (flattest direction / Y)'), option('x', 'X axis'), option('y', 'Y axis'), option('z', 'Z axis'));
     const auto = el('input', { type: 'checkbox', checked: true, onChange: () => (this.autoUpdate = auto.checked) });
     const recompute = el('button', { class: 'primary', onClick: () => this.recompute('full') }, 'Recompute pattern');
-    const reset = el('button', { onClick: () => { this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.settings.manualMode = false; this.recompute('full'); } }, 'Reset manual edits');
+    const reset = el('button', { onClick: () => { this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.settings.deletedHoles.clear(); this.settings.manualMode = false; this.recompute('full'); } }, 'Reset manual edits');
 
     // lists
     this.refs.pieces = el('div', { class: 'list' });
@@ -179,7 +179,7 @@ class App {
     this.refs.tip = tip;
     const slider = el('input', { type: 'range', min: 0, max: 2, step: 0.001, value: 0, onInput: () => this.viewer.setExplode(parseFloat(slider.value)) });
     this.refs.slider = slider;
-    const tog = (key: 'seams' | 'holes' | 'folds' | 'labels', label: string) => {
+    const tog = (key: 'seams' | 'holes' | 'folds' | 'labels' | 'thread', label: string) => {
       const c = el('input', { type: 'checkbox', checked: true, onChange: () => this.viewer.setVisibility({ [key]: c.checked }) });
       return el('label', {}, c, label);
     };
@@ -188,16 +188,18 @@ class App {
     const drop = el('div', { class: 'dropzone' }, 'Drop a 3D model file');
     const center = el('main', { class: 'center' }, viewport, empty,
       el('div', { class: 'overlay-top' },
-        el('div', { class: 'tools' }, toolBtn('select', 'Select', 'Click a piece or seam to inspect it'), toolBtn('cut', 'Cut', 'Drag across the model (or click two points) to add a seam along the shortest path'), toolBtn('move', 'Move', 'Drag a seam to re-route it through the pointer; its ends stay put'), toolBtn('points', 'Points', 'Click a seam to edit its points: drag, multi-select, delete, smooth'), toolBtn('join', 'Join', 'Click a seam to remove it (pieces merge if the leather allows)'), toolBtn('seamtype', 'Seam type', 'Click a seam to toggle turned / butted')),
+        el('div', { class: 'tools' }, toolBtn('select', 'Select', 'Click a piece or seam to inspect it'), toolBtn('cut', 'Cut', 'Drag across the model (or click two points) to add a seam along the shortest path'), toolBtn('move', 'Move', 'Drag a seam to re-route it through the pointer; its ends stay put'), toolBtn('points', 'Points', 'Click a seam to edit its points: drag, multi-select, delete, smooth'), toolBtn('holes', 'Holes', 'Click a stitch hole to remove it and its partner'), toolBtn('join', 'Join', 'Click a seam to remove it (pieces merge if the leather allows)'), toolBtn('seamtype', 'Seam type', 'Click a seam to toggle turned / butted')),
         tip,
         (this.refs.pointActions = el('div', { class: 'tools', style: { display: 'none' } },
           el('button', { title: 'Smooth the selected points (all interior points if none selected). Key: S', onClick: () => this.smoothPoints() }, 'Smooth'),
           el('button', { title: 'Remove the selected points. Key: Delete', onClick: () => this.deletePoints() }, 'Delete'),
           el('button', { title: 'Select every movable point. Key: A', onClick: () => this.selectAllPoints() }, 'Select all'),
-          el('button', { title: 'Add more points along the seam', onClick: () => this.densifyPoints() }, 'More points')))),
+          el('button', { title: 'Add more points along the seam', onClick: () => this.densifyPoints() }, 'More points'))),
+        (this.refs.holeActions = el('div', { class: 'tools', style: { display: 'none' } },
+          el('button', { title: 'Bring back every deleted stitch hole', onClick: () => { this.settings.deletedHoles.clear(); this.recompute('pattern'); } }, 'Restore holes')))),
       el('div', { class: 'overlay-bottom' },
         el('div', { class: 'col' }, slider, el('div', { class: 'stages' }, el('span', {}, 'Assembled'), el('span', {}, 'Exploded'), el('span', {}, 'Flat pattern'))),
-        el('div', { class: 'toggles' }, tog('seams', 'Seams'), tog('holes', 'Holes'), tog('folds', 'Folds'), tog('labels', 'Labels'))),
+        el('div', { class: 'toggles' }, tog('seams', 'Seams'), tog('holes', 'Holes'), tog('thread', 'Thread'), tog('folds', 'Folds'), tog('labels', 'Labels'))),
       drop);
     center.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('active'); });
     center.addEventListener('dragleave', () => drop.classList.remove('active'));
@@ -235,7 +237,7 @@ class App {
     this.rawModel = mesh;
     this.modelName = name;
     if (resetUnits) { this.unitScale = 1; (this.refs.units as HTMLSelectElement).value = 'mm'; }
-    this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.settings.manualMode = false;
+    this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.settings.deletedHoles.clear(); this.settings.manualMode = false;
     this.cutStart = null;
     this.refs.empty.style.display = 'none';
     this.fitCameraNext = true;
@@ -392,14 +394,17 @@ class App {
     this.tool = t;
     this.cutStart = null;
     this.viewer?.showPath([], []);
-    for (const k of ['select', 'cut', 'move', 'points', 'join', 'seamtype'] as Tool[]) this.refs['tool_' + k].classList.toggle('active', k === t);
+    for (const k of ['select', 'cut', 'move', 'points', 'holes', 'join', 'seamtype'] as Tool[]) this.refs['tool_' + k].classList.toggle('active', k === t);
     if (t !== 'points') this.stopEditingPoints();
     this.refs.pointActions.style.display = t === 'points' ? '' : 'none';
+    this.refs.holeActions.style.display = t === 'holes' ? '' : 'none';
+    if (this.viewer) this.viewer.pickHoles = t === 'holes';
     const tips: Record<Tool, string> = {
       select: 'Select: click a piece or a seam to inspect it. Drag to orbit, wheel to zoom, right-drag to pan.',
       cut: 'Cut: press on the model, drag, release (or click two points). A seam follows the shortest surface path; other seams stay where they are.',
       move: 'Move: press on a seam and drag. The seam re-routes through the pointer, keeping its two ends; release to apply. Right-drag orbits.',
       points: 'Points: click a seam to show its points. Click a point (shift-click to add), drag selected points together, Delete removes them, S smooths them, A selects all. Grey end points are junctions and stay fixed.',
+      holes: 'Holes: click a stitch hole to delete it together with its matching hole on the other side of the seam. "Restore holes" brings them all back.',
       join: 'Join: click near a seam to remove it. If the merged piece exceeds the leather stretch limit it is flagged so you can place a better seam.',
       seamtype: 'Seam type: click near a seam to toggle it between turned (allowance added) and butted (holes inset from the cut edge).',
     };
@@ -414,6 +419,14 @@ class App {
       case 'select':
         this.select(nearSeam === null ? p.patchId : null, nearSeam);
         break;
+      case 'holes': {
+        if (!p.hole) { this.setStatus('Holes: click directly on a red stitch hole.'); break; }
+        const seam = this.result.pattern.seams[p.hole.seamId];
+        this.settings.deletedHoles.add(`${seamKey(seam.origEdges)}:${p.hole.index}`);
+        this.setStatus(`Removed hole ${p.hole.index + 1} of seam ${seam.label} on both sides (${this.settings.deletedHoles.size} deleted).`);
+        this.recompute('pattern');
+        break;
+      }
       case 'points': {
         if (p.handle !== undefined) { this.clickHandle(p.handle, !!p.shift); break; }
         if (nearSeam !== null) this.startEditingPoints(nearSeam);

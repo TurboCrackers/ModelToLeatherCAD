@@ -30,6 +30,8 @@ export interface PipelineSettings {
   forbiddenSeamEdges: Set<number>;
   /** after a manual seam edit: keep the user's layout, flag over-strained pieces instead of cutting them */
   manualMode: boolean;
+  /** stitch holes removed by the user (`${seamKey}:${index}`) */
+  deletedHoles: Set<string>;
   layout: LayoutOptions;
 }
 
@@ -49,6 +51,7 @@ export const defaultPipelineSettings = (): PipelineSettings => ({
   forcedSeamEdges: new Set(),
   forbiddenSeamEdges: new Set(),
   manualMode: false,
+  deletedHoles: new Set(),
   layout: { gapMm: 8, sheetWidthMm: 0, marginMm: 10 },
 });
 
@@ -109,6 +112,7 @@ export function runPipeline(model: TriMesh, spec: LeatherSpec, s: PipelineSettin
     seamTypeOverrides: s.seamTypeOverrides,
     rawEdgeAllowanceMm: s.rawEdgeAllowanceMm,
     smoothCutLines: s.smoothCutLines,
+    deletedHoles: s.deletedHoles,
   };
   const pattern = buildPattern(displayTopo, seg, developed, displayPositions, spec, popts);
   layoutPieces(pattern, s.layout);

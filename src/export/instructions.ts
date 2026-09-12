@@ -27,7 +27,7 @@ function needleAndTools(spec: LeatherSpec): string[] {
 
 function seamHow(seam: Seam, set: PatternSet): string {
   const a = set.pieces[seam.sideA.patchId].name, b = set.pieces[seam.sideB.patchId].name;
-  const holes = seam.holeArc.length;
+  const holes = set.pieces[seam.sideA.patchId].holes.filter((h) => h.seamId === seam.id && h.side === 'A').length;
   const head = seam.isDart
     ? `Dart D${seam.label} on piece ${a}: ${mm(seam.length)}, ${holes} holes per side.`
     : seam.isClosure

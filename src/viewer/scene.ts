@@ -15,6 +15,8 @@ export interface PickInfo {
   nearestSeam: { id: number; dist: number } | null;
   /** index of a seam-editing handle under the pointer, if any */
   handle?: number;
+  /** stitch hole under the pointer (when hole picking is enabled) */
+  hole?: { piece: number; holeIndex: number; seamId: number; index: number };
   shift?: boolean;
 }
 
@@ -23,6 +25,7 @@ export interface ViewerVisibility {
   holes: boolean;
   folds: boolean;
   labels: boolean;
+  thread: boolean;
 }
 
 export function patchColor(i: number): THREE.Color {
@@ -51,7 +54,12 @@ export class Viewer {
   private handleVerts: number[] = [];
   private res: PipelineResult | null = null;
   private explode = 0;
-  private visibility: ViewerVisibility = { seams: true, holes: true, folds: true, labels: true };
+  private visibility: ViewerVisibility = { seams: true, holes: true, folds: true, labels: true, thread: true };
+  /** when true, stitch holes are picked before the surface */
+  pickHoles = false;
+  private holeInfo: Array<{ piece: number; holeIndex: number; seamId: number; index: number; side: 'A' | 'B' }> = [];
+  private threadPairs: number[] = []; // instance index pairs
+  private threadLines: THREE.LineSegments | null = null;
   private selectedSeam: number | null = null;
   // per cut vertex, 3 states × 3 coords
   private s0!: Float32Array;
@@ -137,6 +145,14 @@ export class Viewer {
         const idx = this.handleMeshes.indexOf(hh[0].object as THREE.Mesh);
         const pt = hh[0].point;
         return { face: -1, patchId: -1, vertex: this.handleVerts[idx], point: [pt.x, pt.y, pt.z], nearestSeam: null, handle: idx };
+      }
+    }
+    if (this.pickHoles && this.holes) {
+      const hh = ray.intersectObject(this.holes, false);
+      if (hh.length && hh[0].instanceId !== undefined) {
+        const info = this.holeInfo[hh[0].instanceId];
+        const pt = hh[0].point;
+        return { face: -1, patchId: info.piece, vertex: -1, point: [pt.x, pt.y, pt.z], nearestSeam: { id: info.seamId, dist: 0 }, hole: info };
       }
     }
     const hits = ray.intersectObject(this.mesh, false);
@@ -232,7 +248,7 @@ export class Viewer {
 
   clear(): void {
     this.root.clear();
-    this.mesh = null; this.seamLines = null; this.foldLines = null; this.holes = null; this.labels = []; this.pathLine = null; this.highlightLine = null; this.markers = [];
+    this.mesh = null; this.seamLines = null; this.foldLines = null; this.holes = null; this.labels = []; this.pathLine = null; this.highlightLine = null; this.markers = []; this.threadLines = null; this.holeInfo = []; this.threadPairs = [];
     this.needsRender = true;
   }
 
@@ -357,7 +373,17 @@ export class Viewer {
 
     // holes
     const holeList: Array<{ p3: V3; patch: number; p2: [number, number] }> = [];
-    pattern.pieces.forEach((pc) => pc.holes.forEach((h) => holeList.push({ p3: h.p3, patch: pc.id, p2: toLayout(pc, h.p) })));
+    this.holeInfo = [];
+    pattern.pieces.forEach((pc) => pc.holes.forEach((h, hi) => { holeList.push({ p3: h.p3, patch: pc.id, p2: toLayout(pc, h.p) }); this.holeInfo.push({ piece: pc.id, holeIndex: hi, seamId: h.seamId, index: h.index, side: h.side }); }));
+    // matched pairs (same seam, same index, opposite sides) for the thread visualisation
+    const bySeam = new Map<string, number>();
+    this.threadPairs = [];
+    this.holeInfo.forEach((info, i) => {
+      const k = `${info.seamId}:${info.index}`;
+      const other = bySeam.get(k);
+      if (other !== undefined && this.holeInfo[other].side !== info.side) this.threadPairs.push(other, i);
+      else bySeam.set(k, i);
+    });
     const nh = holeList.length;
     this.h0 = new Float32Array(3 * nh); this.h1 = new Float32Array(3 * nh); this.h2 = new Float32Array(3 * nh);
     holeList.forEach((h, i) => {
@@ -369,7 +395,16 @@ export class Viewer {
     this.holeRadius = Math.max(pattern.spec.holeDiameterMm / 2, size * 0.004);
     if (nh) {
       this.holes = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 10, 8), new THREE.MeshBasicMaterial({ color: 0xff2e2e }), nh);
+      this.holes.visible = this.visibility.holes;
       this.root.add(this.holes);
+    }
+    if (this.threadPairs.length) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3 * this.threadPairs.length), 3));
+      this.threadLines = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xf1e3c4, transparent: true, opacity: 1, depthTest: false }));
+      this.threadLines.renderOrder = 12;
+      this.threadLines.visible = this.visibility.thread;
+      this.root.add(this.threadLines);
     }
     // labels
     this.labels = pattern.pieces.map((pc) => {
@@ -413,6 +448,7 @@ export class Viewer {
     if (this.seamLines) this.seamLines.visible = this.visibility.seams;
     if (this.foldLines) this.foldLines.visible = this.visibility.folds;
     if (this.holes) this.holes.visible = this.visibility.holes;
+    if (this.threadLines) this.threadLines.visible = this.visibility.thread && this.explode < 0.3;
     for (const l of this.labels) l.visible = this.visibility.labels;
     this.needsRender = true;
   }
@@ -523,6 +559,17 @@ export class Viewer {
       }
       this.holes.instanceMatrix.needsUpdate = true;
       this.holes.computeBoundingSphere();
+      if (this.threadLines) {
+        // links between matched holes: shown while assembled, fading out over the first 30% of the explode
+        const arr = (this.threadLines.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array;
+        const pos = (i: number, k: number) => { const e = this.h0[3 * i + k] + (this.h1[3 * i + k] - this.h0[3 * i + k]) * a; return e + (this.h2[3 * i + k] - e) * b; };
+        for (let q = 0; q < this.threadPairs.length; q++) for (let k = 0; k < 3; k++) arr[3 * q + k] = pos(this.threadPairs[q], k);
+        (this.threadLines.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+        this.threadLines.geometry.computeBoundingSphere();
+        const fade = Math.max(0, 1 - t / 0.3);
+        (this.threadLines.material as THREE.LineBasicMaterial).opacity = fade;
+        this.threadLines.visible = this.visibility.thread && fade > 0;
+      }
     }
     // labels at piece centroids
     this.labels.forEach((sp, p) => {
