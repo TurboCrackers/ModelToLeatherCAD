@@ -322,7 +322,7 @@ class App {
     this.refs.seams.replaceChildren(...seams.map((s) => {
       const sel = el('select', { onChange: (e: Event) => { e.stopPropagation(); this.setSeamType(s.id, sel.value as SeamType); }, onClick: (e: Event) => e.stopPropagation() }, option('turned', 'turned', s.type === 'turned'), option('butted', 'butted', s.type === 'butted'));
       return el('div', { class: 'item' + (this.selectedSeam === s.id ? ' selected' : ''), onClick: () => this.select(null, s.id) },
-        el('span', { class: 'grow' }, `${s.isDart ? 'Dart D' : 'Seam '}${s.label}: ${pieces[s.sideA.patchId].name}${s.isDart ? '' : ' ↔ ' + pieces[s.sideB.patchId].name} · ${s.length.toFixed(0)} mm · ${s.holeArc.length} holes`),
+        el('span', { class: 'grow' }, `${s.isDart ? 'Dart D' : s.isClosure ? 'Closure J' : 'Seam '}${s.label}: ${pieces[s.sideA.patchId].name}${s.isDart || s.isClosure ? '' : ' ↔ ' + pieces[s.sideB.patchId].name} · ${s.length.toFixed(0)} mm · ${s.holeArc.length} holes`),
         sel);
     }));
   }

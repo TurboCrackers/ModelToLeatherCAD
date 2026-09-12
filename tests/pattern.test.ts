@@ -13,7 +13,7 @@ function check(model: ReturnType<typeof makeBox>, familyId: string, tMm: number)
   for (const seam of pattern.seams) {
     const a = pattern.pieces[seam.sideA.patchId].holes.filter((h) => h.seamId === seam.id).length;
     const b = pattern.pieces[seam.sideB.patchId].holes.filter((h) => h.seamId === seam.id).length;
-    if (seam.isDart) expect(a).toBe(2 * seam.holeArc.length);
+    if (seam.isDart || seam.isClosure) expect(a).toBe(2 * seam.holeArc.length);
     else { expect(a).toBe(seam.holeArc.length); expect(b).toBe(seam.holeArc.length); }
     expect(seam.sideA.count).toBe(seam.origEdges.length);
     expect(seam.sideB.count).toBe(seam.origEdges.length);

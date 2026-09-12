@@ -935,6 +935,3 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
   }
   return { cut, faceToPatch, patches, edgeClass, warnings, splits };
 }
-
-/** test hook */
-export function componentInfoForTest(ct: MeshTopology, faces: Int32Array): number { return componentInfo(ct, faces).boundaryVerts.size; }

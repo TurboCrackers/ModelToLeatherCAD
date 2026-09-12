@@ -324,27 +324,37 @@ export function buildTopology(mesh: TriMesh): MeshTopology {
 export function offsetMesh(topo: MeshTopology, distance: number): TriMesh {
   const m = topo.mesh;
   const p = new Float64Array(m.positions.length);
-  const lambda = 0.05;
+  const lambda = 1e-4;
   for (let v = 0; v < m.nv; v++) {
     const nv: V3 = [topo.vertexNormals[3 * v], topo.vertexNormals[3 * v + 1], topo.vertexNormals[3 * v + 2]];
-    // distinct adjacent face normals (cluster within ~5°)
-    const normals: V3[] = [];
+    // distinct adjacent face planes (normals clustered within ~5°), weighted by incident area
+    const clusters: Array<{ n: V3; area: number }> = [];
     for (const f of csrRange(topo.vertexFaces, v)) {
       const n: V3 = [topo.faceNormals[3 * f], topo.faceNormals[3 * f + 1], topo.faceNormals[3 * f + 2]];
-      if (!normals.some((q) => dot3(q, n) > 0.996)) normals.push(n);
+      const c = clusters.find((q) => dot3(q.n, n) > 0.996);
+      if (c) c.area += topo.faceAreas[f]; else clusters.push({ n, area: topo.faceAreas[f] });
     }
-    // solve (Σ n nᵀ + λI) d = Σ n·distance + λ·nv·distance  for the displacement d
-    const A = [[lambda, 0, 0], [0, lambda, 0], [0, 0, lambda]];
-    const b = [lambda * nv[0] * distance, lambda * nv[1] * distance, lambda * nv[2] * distance];
-    for (const n of normals) {
-      for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) A[i][j] += n[i] * n[j]; b[i] += n[i] * distance; }
+    // a vertex can sit exactly at the offset of at most three planes; try the three that matter
+    // most, then two, and accept only (near) exact solutions so flat regions stay exactly flat
+    clusters.sort((a, b) => b.area - a.area);
+    const fallback = [nv[0] * distance, nv[1] * distance, nv[2] * distance];
+    let d = fallback;
+    for (const count of [3, 2]) {
+      if (clusters.length < count) continue;
+      const normals = clusters.slice(0, count).map((c) => c.n);
+      const A = [[lambda, 0, 0], [0, lambda, 0], [0, 0, lambda]];
+      const b = [lambda * fallback[0], lambda * fallback[1], lambda * fallback[2]];
+      for (const n of normals) {
+        for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) A[i][j] += n[i] * n[j]; b[i] += n[i] * distance; }
+      }
+      const sol = solve3(A, b);
+      if (!sol) continue;
+      const L = Math.hypot(sol[0], sol[1], sol[2]);
+      const residual = Math.max(...normals.map((n) => Math.abs(n[0] * sol[0] + n[1] * sol[1] + n[2] * sol[2] - distance)));
+      if (residual <= 0.02 * Math.abs(distance) && L <= 2 * Math.abs(distance)) { d = sol; break; }
     }
-    const d = solve3(A, b) ?? [nv[0] * distance, nv[1] * distance, nv[2] * distance];
-    // guard against spikes at very acute corners
-    const L = Math.hypot(d[0], d[1], d[2]);
-    const maxL = 3 * Math.abs(distance);
-    const sc = L > maxL ? maxL / L : 1;
-    for (let k = 0; k < 3; k++) p[3 * v + k] = m.positions[3 * v + k] + d[k] * sc;
+    if (clusters.length === 1) d = [clusters[0].n[0] * distance, clusters[0].n[1] * distance, clusters[0].n[2] * distance];
+    for (let k = 0; k < 3; k++) p[3 * v + k] = m.positions[3 * v + k] + d[k];
   }
   return { ...m, positions: p };
 }

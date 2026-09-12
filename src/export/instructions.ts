@@ -30,7 +30,9 @@ function seamHow(seam: Seam, set: PatternSet): string {
   const holes = seam.holeArc.length;
   const head = seam.isDart
     ? `Dart D${seam.label} on piece ${a}: ${mm(seam.length)}, ${holes} holes per side.`
-    : `Seam ${seam.label}: piece ${a} to piece ${b}, ${mm(seam.length)}, ${holes} holes per side.`;
+    : seam.isClosure
+      ? `Closure J${seam.label}: join the two ends of piece ${a} into a ring, ${mm(seam.length)}, ${holes} holes per side.`
+      : `Seam ${seam.label}: piece ${a} to piece ${b}, ${mm(seam.length)}, ${holes} holes per side.`;
   const how = seam.type === 'turned'
     ? seam.isDart
       ? `Fold the piece grain-to-grain along the dart so the two rows of holes line up, stitch through the matched holes on the dashed stitch line, then open the piece out; the wedge folds to the flesh side (do not cut the wedge).`
@@ -46,7 +48,7 @@ export function assemblyOrder(set: PatternSet): Seam[] {
   const { pieces, seams } = set;
   const out: Seam[] = [];
   const used = new Set<number>();
-  for (const s of seams) if (s.isDart) { out.push(s); used.add(s.id); }
+  for (const s of seams) if (s.isDart || s.isClosure) { out.push(s); used.add(s.id); }
   const attached = new Set<number>();
   const byArea = pieces.slice().sort((a, b) => b.areaMm2 - a.areaMm2);
   if (byArea.length) attached.add(byArea[0].id);
@@ -56,7 +58,7 @@ export function assemblyOrder(set: PatternSet): Seam[] {
     // pick the longest seam between an attached and an unattached piece
     let best: Seam | null = null;
     for (const s of seams) {
-      if (used.has(s.id) || s.isDart) continue;
+      if (used.has(s.id) || s.isDart || s.isClosure) continue;
       const a = attached.has(s.sideA.patchId), b = attached.has(s.sideB.patchId);
       if (a !== b && (!best || s.length > best.length)) best = s;
     }
@@ -112,7 +114,7 @@ export function buildInstructions(set: PatternSet, dryLimit: number, effectiveLi
   sections.push({
     title: 'Legend',
     lines: [
-      'Solid black line: cut. Red circles: stitch holes (Ø as specified). Grey dashed line: stitch line of a turned seam. Blue dash-dot line: fold (do not cut). Short ticks: seam ends — match them across the two pieces. Numbers: seam numbers, identical on both sides of a seam; D = dart, sewn to itself.',
+      'Solid black line: cut. Red circles: stitch holes (Ø as specified). Grey dashed line: stitch line of a turned seam. Blue dash-dot line: fold (do not cut). Short ticks: seam ends — match them across the two pieces. Numbers: seam numbers, identical on both sides of a seam; D = dart (slit sewn to itself), J = closure joining two ends of one piece.',
       `Generated for "${title}" by Model to Leather CAD.`,
     ],
   });

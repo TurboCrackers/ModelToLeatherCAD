@@ -16,12 +16,16 @@ export function toLayout(piece: Piece, p: V2): V2 {
 
 function bestRotation(outline: V2[]): { angle: number; w: number; h: number; min: V2 } {
   let best = { angle: 0, w: Infinity, h: Infinity, min: [0, 0] as V2, area: Infinity };
-  for (let deg = 0; deg < 180; deg += 5) {
+  const evaluate = (deg: number) => {
     const a = (deg * Math.PI) / 180;
     const bb = bbox(outline.map((p) => rotate2(p, a)));
     const area = bb.w * bb.h;
     if (area < best.area - 1e-9) best = { angle: a, w: bb.w, h: bb.h, min: bb.min, area };
-  }
+  };
+  for (let deg = 0; deg < 180; deg += 5) evaluate(deg);
+  // refine around the coarse optimum so rectangles land square on the page
+  const coarse = (best.angle * 180) / Math.PI;
+  for (let deg = coarse - 5; deg <= coarse + 5; deg += 0.25) evaluate(deg);
   return best;
 }
 

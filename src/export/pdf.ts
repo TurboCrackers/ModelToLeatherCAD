@@ -100,7 +100,7 @@ export function exportPdf(set: PatternSet, opts: PdfOptions): jsPDF {
   doc.setFontSize(8);
   doc.text('Pieces: ' + set.pieces.map((p) => `${p.name} ${(p.areaMm2 / 100).toFixed(0)} cm2${p.overStrained ? ' (!)' : ''}`).join('   '), m, y, { maxWidth: cw });
   y += 8;
-  doc.text('Seams: ' + set.seams.map((sm) => `${sm.isDart ? 'D' : ''}${sm.label}: ${sm.type}, ${sm.length.toFixed(0)} mm, ${sm.holeArc.length} holes, ${set.pieces[sm.sideA.patchId].name}-${set.pieces[sm.sideB.patchId].name}`).join('   '), m, y, { maxWidth: cw });
+  doc.text('Seams: ' + set.seams.map((sm) => `${sm.isDart ? 'D' : sm.isClosure ? 'J' : ''}${sm.label}: ${sm.type}, ${sm.length.toFixed(0)} mm, ${sm.holeArc.length} holes, ${set.pieces[sm.sideA.patchId].name}-${set.pieces[sm.sideB.patchId].name}`).join('   '), m, y, { maxWidth: cw });
   y += 14;
   doc.text('Legend: solid black = cut line, red circles = stitch holes, grey dashed = stitch line (turned seams), blue dash-dot = fold line, ticks = seam ends. D = dart (sewn to itself).', m, y, { maxWidth: cw });
   y += 8;

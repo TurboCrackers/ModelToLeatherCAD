@@ -33,7 +33,10 @@ export interface Seam {
   id: number;
   label: string;
   type: SeamType;
+  /** slit sewn to itself (both runs meet at a tip) */
   isDart: boolean;
+  /** joins two ends of the same piece (a band closed into a ring) */
+  isClosure: boolean;
   origEdges: number[];
   /** developed 3D chain points in side-A travel order */
   chain3D: V3[];
@@ -274,6 +277,11 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
       const id = seams.length;
       const sideA: SeamSide = { patchId: pi, loopIndex: lj, start: run[0], count: run.length };
       const sideB: SeamSide = { patchId: first.piece, loopIndex: first.loop, start: last.index, count: run.length };
+      // same piece on both sides: a dart (slit with a tip, the two runs meet in the loop) or a closure
+      // seam joining two ends of the piece (e.g. a band wrapped into a ring)
+      const samePiece = first.piece === pi && first.loop === lj;
+      const runEnd = run[run.length - 1];
+      const adjacentRuns = samePiece && (sideB.start === (runEnd + 1) % n || (sideB.start + run.length) % n === run[0]);
       const key = seamKey(origEdges);
       const type = opts.seamTypeOverrides.get(key) ?? opts.defaultSeamType;
       // 3D chain along side A
@@ -306,7 +314,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
         for (let i = 0; i < count; i++) holeArc.push(s0 + i * pitch);
       }
       const seam: Seam = {
-        id, label: `${id + 1}`, type, isDart: first.piece === pi, origEdges, chain3D, chainDisplay, plan, smoothDisplay, arc, length, sideA, sideB, holeArc, pitch,
+        id, label: `${id + 1}`, type, isDart: adjacentRuns, isClosure: samePiece && !adjacentRuns, origEdges, chain3D, chainDisplay, plan, smoothDisplay, arc, length, sideA, sideB, holeArc, pitch,
         allowanceMm: type === 'turned' ? spec.seamAllowanceMm : 0,
         insetMm: type === 'turned' ? 0 : spec.edgeMarginMm,
       };
@@ -389,7 +397,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
           // label and notches
           const mid = pointAtArc(s2, L2 / 2);
           const midInward = isA ? perp2(mid.dir) : scale2(perp2(mid.dir), -1);
-          pc.seamLabels.push({ seamId, p: add2(mid.p, scale2(midInward, sm.insetMm + Math.max(4, spec.edgeMarginMm + 2))), text: sm.isDart ? `D${sm.label}` : sm.label });
+          pc.seamLabels.push({ seamId, p: add2(mid.p, scale2(midInward, sm.insetMm + Math.max(4, spec.edgeMarginMm + 2))), text: sm.isDart ? `D${sm.label}` : sm.isClosure ? `J${sm.label}` : sm.label });
           const notchLen = sm.allowanceMm + 3;
           for (const q of [pointAtArc(s2, 0), pointAtArc(s2, L2)]) {
             const out = isA ? scale2(perp2(q.dir), -1) : perp2(q.dir);

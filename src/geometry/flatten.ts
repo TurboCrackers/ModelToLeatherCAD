@@ -194,6 +194,7 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
   const bu = new Float64Array(nv), bv = new Float64Array(nv);
   const U = new Float64Array(nv), Vv = new Float64Array(nv);
   for (let i = 0; i < nv; i++) { U[i] = uv[2 * i]; Vv[i] = uv[2 * i + 1]; }
+  const lscmU = Float64Array.from(U), lscmV = Float64Array.from(Vv);
   const rot = new Float64Array(2 * nf); // cos, sin per face
 
   const computeRotations = () => {
@@ -234,7 +235,20 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
   }
   for (let i = 0; i < nv; i++) { uv[2 * i] = U[i]; uv[2 * i + 1] = Vv[i]; }
 
-  // ---- strain
+  // ---- strain (ARAP with clamped weights can be worse than LSCM on sliver triangles: keep the better)
+  const arap = measureStrain(tris, localFaces, U, Vv, nf);
+  const lscm = measureStrain(tris, localFaces, lscmU, lscmV, nf);
+  const useLscm = lscm.flipped <= arap.flipped && lscm.maxStrain < arap.maxStrain;
+  const best = useLscm ? lscm : arap;
+  if (useLscm) for (let i = 0; i < nv; i++) { uv[2 * i] = lscmU[i]; uv[2 * i + 1] = lscmV[i]; }
+  return {
+    vertices: Int32Array.from(verts), localIndex, localFaces, faces, uv, faceStrain: best.faceStrain,
+    maxStrain: best.maxStrain, meanStrain: area3D > 0 ? best.meanAcc / area3D : 0, flippedFaces: best.flipped, area3D, area2D: best.area2D,
+  };
+}
+
+function measureStrain(tris: LocalTri[], localFaces: Int32Array, U: Float64Array, Vv: Float64Array, nf: number) {
+  const faceStrain = new Float64Array(nf);
   let maxStrain = 0, meanAcc = 0, flipped = 0, area2D = 0;
   for (let t = 0; t < nf; t++) {
     const tri = tris[t];
@@ -254,8 +268,5 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
     meanAcc += strain * tri.area;
     area2D += Math.abs(du1 * dv2 - du2 * dv1) / 2;
   }
-  return {
-    vertices: Int32Array.from(verts), localIndex, localFaces, faces, uv, faceStrain,
-    maxStrain, meanStrain: area3D > 0 ? meanAcc / area3D : 0, flippedFaces: flipped, area3D, area2D,
-  };
+  return { faceStrain, maxStrain, meanAcc, flipped, area2D };
 }
