@@ -480,14 +480,38 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     }
     if (!sides.length) mStart = mEnd = Math.max(seam.pitch * 0.6, seam.insetMm + seam.pitch * 0.5);
     const L = seam.length;
-    const usable = L - mStart - mEnd;
     seam.holeArc.length = 0;
+    // interior corners of the seam (where it turns sharply, e.g. around a box edge) also
+    // interrupt the row: stop one pitch plus the margin on either side of the corner
+    const sm3 = seam.smoothDisplay;
+    const cornerArcs: number[] = [];
+    {
+      let acc = 0;
+      const arcs: number[] = [0];
+      for (let j = 1; j < sm3.length; j++) { acc += Math.hypot(...sub3(sm3[j], sm3[j - 1])); arcs.push(acc); }
+      const scaleArc = acc > 0 ? L / acc : 1;
+      for (let j = 1; j < sm3.length - 1; j++) {
+        const d1 = sub3(sm3[j], sm3[j - 1]), d2 = sub3(sm3[j + 1], sm3[j]);
+        const l1 = Math.hypot(...d1), l2 = Math.hypot(...d2);
+        if (l1 < 1e-9 || l2 < 1e-9) continue;
+        const cosT = (d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]) / (l1 * l2);
+        if (cosT < Math.cos((35 * Math.PI) / 180)) {
+          const a = arcs[j] * scaleArc;
+          if (!cornerArcs.length || a - cornerArcs[cornerArcs.length - 1] > seam.pitch) cornerArcs.push(a);
+        }
+      }
+    }
+    const cornerGap = seam.insetMm + seam.pitch;
+    const bounds = [0, ...cornerArcs, L];
     if (L >= 3 * spec.holeDiameterMm) {
-      if (usable < 0) seam.holeArc.push(L / 2);
-      else {
+      for (let g = 0; g < bounds.length - 1; g++) {
+        const from = bounds[g] + (g === 0 ? mStart : cornerGap);
+        const to = bounds[g + 1] - (g === bounds.length - 2 ? mEnd : cornerGap);
+        const usable = to - from;
+        if (usable < 0) { if (bounds.length === 2) seam.holeArc.push(L / 2); continue; }
         // nominal pitch, row centred between the two margins
         const n = Math.floor(usable / seam.pitch + 1e-6) + 1;
-        const s0 = mStart + (usable - (n - 1) * seam.pitch) / 2;
+        const s0 = from + (usable - (n - 1) * seam.pitch) / 2;
         for (let k = 0; k < n; k++) seam.holeArc.push(s0 + k * seam.pitch);
       }
     }
