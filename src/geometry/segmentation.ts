@@ -42,6 +42,8 @@ const GORE_ITERATIONS = 8;
 const goreEdges = new Set<number>();
 /** components already verified inside the gore check for the current run */
 let preValidated: Array<{ faces: Int32Array; flat: FlattenResult }> = [];
+/** regions (min face id + size) where a gore search already failed in this run */
+const goreFailed = new Set<string>();
 const FINAL_ITERATIONS = 14;
 
 export const EDGE_SMOOTH = 0;
@@ -266,6 +268,9 @@ function goreCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams, f
   const info = componentInfo(ct, faces);
   // gores are for the large smooth regions; small leftovers use the cheap fallback cuts
   if (faces.length < 8 || faces.length < 0.15 * ct.mesh.nf) return null;
+  let minF = Infinity; for (const f of faces) if (f < minF) minF = f;
+  const regionKey = `${minF}_${faces.length}`;
+  if (goreFailed.has(regionKey)) return null;
   // area-weighted centroid & covariance of face centroids
   let A = 0; const c = [0, 0, 0];
   for (const f of faces) { const w = ct.faceAreas[f]; A += w; for (let k = 0; k < 3; k++) c[k] += ct.faceCentroids[3 * f + k] * w; }
@@ -444,6 +449,7 @@ function goreCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams, f
     }
     if (best && best.maxStrain > params.stretchLimit * 4) break; // hopeless: skip the equator series
   }
+  goreFailed.add(regionKey);
   return best ? { edges: best.edges, ok: false } : null;
 }
 
@@ -724,6 +730,65 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
     if (th >= creaseAngle) { if (!params.canCreaseFold) hard[e] = 1; continue; }
     if (estimateBendRadius(th, (params.edgeStripWidth ?? topo.edgeStripWidth)[e]) < params.minBendRadiusMm) isTightEdge[e] = 1;
   }
+  // A fold is only possible along a straight crease: a crease that curves (a flat bottom
+  // meeting a rounded wall) cannot be folded and must be sewn. Judge per connected crease chain.
+  {
+    const ot = params.origTopo && params.faceChildren && params.faceChildren > 1 ? params.origTopo : topo;
+    const isCrease = (e: number) => ot.edgeFaces[2 * e + 1] >= 0 && ot.dihedral[e] >= creaseAngle;
+    const creaseAt: number[][] = Array.from({ length: ot.mesh.nv }, () => []);
+    for (let e = 0; e < ot.ne; e++) if (isCrease(e)) { creaseAt[ot.edgeVerts[2 * e]].push(e); creaseAt[ot.edgeVerts[2 * e + 1]].push(e); }
+    const seenE = new Uint8Array(ot.ne);
+    const curvedOrig = new Set<number>();
+    const P = ot.mesh.positions;
+    const dir = (e: number, from: number): number[] => { const a = ot.edgeVerts[2 * e], b = ot.edgeVerts[2 * e + 1]; const to = a === from ? b : a; const d = [P[3 * to] - P[3 * from], P[3 * to + 1] - P[3 * from + 1], P[3 * to + 2] - P[3 * from + 2]]; const l = Math.hypot(d[0], d[1], d[2]) || 1; return d.map((v) => v / l); };
+    for (let e0 = 0; e0 < ot.ne; e0++) {
+      if (!isCrease(e0) || seenE[e0]) continue;
+      // grow the chain in both directions through vertices with exactly two crease edges
+      const chain = [e0]; seenE[e0] = 1;
+      for (const side of [0, 1]) {
+        let e = e0, v = ot.edgeVerts[2 * e0 + side];
+        for (let guard = 0; guard < ot.ne; guard++) {
+          const nexts = creaseAt[v].filter((x) => x !== e);
+          if (creaseAt[v].length !== 2 || nexts.length !== 1 || seenE[nexts[0]]) break;
+          e = nexts[0]; seenE[e] = 1; chain.push(e);
+          v = ot.edgeVerts[2 * e] === v ? ot.edgeVerts[2 * e + 1] : ot.edgeVerts[2 * e];
+        }
+      }
+      // max turning between consecutive chain edges
+      let maxTurn = 0;
+      for (const v of new Set(chain.flatMap((e) => [ot.edgeVerts[2 * e], ot.edgeVerts[2 * e + 1]]))) {
+        const es = creaseAt[v].filter((x) => chain.includes(x));
+        if (es.length !== 2) continue;
+        const d1 = dir(es[0], v), d2 = dir(es[1], v);
+        const turn = Math.PI - Math.acos(Math.max(-1, Math.min(1, d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2])));
+        maxTurn = Math.max(maxTurn, turn);
+      }
+      if (maxTurn > (8 * Math.PI) / 180) for (const e of chain) curvedOrig.add(e);
+    }
+    if (curvedOrig.size) {
+      if (ot === topo) { for (const e of curvedOrig) if (!params.forbiddenSeamEdges.has(e)) hard[e] = 1; }
+      else {
+        // map original crease edges to refined sub-edges via lineage (both endpoints on that original edge)
+        const lineageOf = params.edgeStripWidth ? null : null; void lineageOf;
+        for (let e = 0; e < topo.ne; e++) {
+          if (topo.edgeFaces[2 * e + 1] < 0 || topo.dihedral[e] < creaseAngle) continue;
+          // a refined crease edge lies on exactly one original crease edge: find it by geometry (midpoint on the segment)
+          const a = topo.edgeVerts[2 * e], b = topo.edgeVerts[2 * e + 1];
+          const mx = (topo.mesh.positions[3 * a] + topo.mesh.positions[3 * b]) / 2, my = (topo.mesh.positions[3 * a + 1] + topo.mesh.positions[3 * b + 1]) / 2, mz = (topo.mesh.positions[3 * a + 2] + topo.mesh.positions[3 * b + 2]) / 2;
+          for (const oe of curvedOrig) {
+            const oa = ot.edgeVerts[2 * oe], ob = ot.edgeVerts[2 * oe + 1];
+            const ax = P[3 * oa], ay = P[3 * oa + 1], az = P[3 * oa + 2], bx = P[3 * ob], by = P[3 * ob + 1], bz = P[3 * ob + 2];
+            const ux = bx - ax, uy = by - ay, uz = bz - az; const L2 = ux * ux + uy * uy + uz * uz || 1;
+            const t = ((mx - ax) * ux + (my - ay) * uy + (mz - az) * uz) / L2;
+            if (t < -1e-6 || t > 1 + 1e-6) continue;
+            const px = ax + ux * t, py = ay + uy * t, pz = az + uz * t;
+            if (Math.hypot(mx - px, my - py, mz - pz) < 1e-6 * Math.sqrt(L2) + 1e-6) { if (!params.forbiddenSeamEdges.has(e)) hard[e] = 1; break; }
+          }
+        }
+      }
+    }
+  }
+
   const tightFace = new Uint8Array(nf);
   if (params.origTopo && params.faceChildren && params.faceChildren > 1) {
     // judge tightness on the original mesh, then inherit per refined child face
@@ -795,6 +860,7 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
   const protectedSeams = new Set(seams);
   goreEdges.clear();
   preValidated = [];
+  goreFailed.clear();
 
   // ---- 3. cut → flatten → refine
   const validated = new Uint8Array(nf);
