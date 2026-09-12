@@ -23,6 +23,7 @@ Open the URL Vite prints (default http://localhost:5173). `npm run build` produc
    - **Select** – click a piece or seam for details; the seam list lets you change each seam's construction.
    - **Cut** – press on the model, drag, release (or click two points); a seam is added along the shortest path across the surface, with a live preview.
    - **Move** – press on a seam and drag; the seam re-routes through the pointer while keeping both ends, release to apply.
+   - **Points** – click a seam to show its control points. Click to select (shift-click to add), drag selected points together, *Delete* removes them, *Smooth* (S) relaxes them, *Select all* (A), *More points* adds handles. Grey end points are junctions and stay fixed.
    - **Join** – click a seam to remove it.
    - **Seam type** – click a seam to toggle turned ↔ butted.
 

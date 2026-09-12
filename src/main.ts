@@ -6,13 +6,15 @@ import { TriMesh, boundingBox, transformMesh, buildTopology, orientMesh } from '
 import { loadModelFile } from './geometry/loaders';
 import { makeBox, makeCylinder, makeSphere, makePouch, makeTorus } from './geometry/primitives';
 import { shortestEdgePath } from './geometry/paths';
+import { simplifyIndices } from './pattern/smooth';
+import { V3 } from './geometry/vec';
 import { runPipeline, defaultPipelineSettings, PipelineResult, PipelineSettings, effectiveStretchLimit } from './pattern/pipeline';
 import { seamKey } from './pattern/pattern';
 import { exportSvg } from './export/svg';
 import { exportPdf, PaperSize } from './export/pdf';
 import { Viewer, PickInfo, patchColor } from './viewer/scene';
 
-type Tool = 'select' | 'cut' | 'move' | 'join' | 'seamtype';
+type Tool = 'select' | 'cut' | 'move' | 'points' | 'join' | 'seamtype';
 const UNIT_SCALE: Record<string, number> = { mm: 1, cm: 10, m: 1000, in: 25.4 };
 
 class App {
@@ -50,6 +52,15 @@ class App {
     this.viewer.onDragEnd = (p) => this.onDragEnd(p);
     this.refreshLeatherUI();
     this.setStatus('Load a model (STL, OBJ, PLY, glTF) or pick a sample shape to begin.');
+    window.addEventListener('keydown', (e) => {
+      if (this.tool !== 'points' || !this.edit) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+      if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); this.deletePoints(); }
+      else if (e.key === 's' || e.key === 'S') { e.preventDefault(); this.smoothPoints(); }
+      else if (e.key === 'a' || e.key === 'A') { e.preventDefault(); this.selectAllPoints(); }
+      else if (e.key === 'Escape') { this.edit.selected.clear(); this.refreshHandles(); }
+    });
   }
 
   // ───────────────────────── UI construction
@@ -177,8 +188,13 @@ class App {
     const drop = el('div', { class: 'dropzone' }, 'Drop a 3D model file');
     const center = el('main', { class: 'center' }, viewport, empty,
       el('div', { class: 'overlay-top' },
-        el('div', { class: 'tools' }, toolBtn('select', 'Select', 'Click a piece or seam to inspect it'), toolBtn('cut', 'Cut', 'Drag across the model (or click two points) to add a seam along the shortest path'), toolBtn('move', 'Move', 'Drag a seam to re-route it through the pointer; its ends stay put'), toolBtn('join', 'Join', 'Click a seam to remove it (pieces merge if the leather allows)'), toolBtn('seamtype', 'Seam type', 'Click a seam to toggle turned / butted')),
-        tip),
+        el('div', { class: 'tools' }, toolBtn('select', 'Select', 'Click a piece or seam to inspect it'), toolBtn('cut', 'Cut', 'Drag across the model (or click two points) to add a seam along the shortest path'), toolBtn('move', 'Move', 'Drag a seam to re-route it through the pointer; its ends stay put'), toolBtn('points', 'Points', 'Click a seam to edit its points: drag, multi-select, delete, smooth'), toolBtn('join', 'Join', 'Click a seam to remove it (pieces merge if the leather allows)'), toolBtn('seamtype', 'Seam type', 'Click a seam to toggle turned / butted')),
+        tip,
+        (this.refs.pointActions = el('div', { class: 'tools', style: { display: 'none' } },
+          el('button', { title: 'Smooth the selected points (all interior points if none selected). Key: S', onClick: () => this.smoothPoints() }, 'Smooth'),
+          el('button', { title: 'Remove the selected points. Key: Delete', onClick: () => this.deletePoints() }, 'Delete'),
+          el('button', { title: 'Select every movable point. Key: A', onClick: () => this.selectAllPoints() }, 'Select all'),
+          el('button', { title: 'Add more points along the seam', onClick: () => this.densifyPoints() }, 'More points')))),
       el('div', { class: 'overlay-bottom' },
         el('div', { class: 'col' }, slider, el('div', { class: 'stages' }, el('span', {}, 'Assembled'), el('span', {}, 'Exploded'), el('span', {}, 'Flat pattern'))),
         el('div', { class: 'toggles' }, tog('seams', 'Seams'), tog('holes', 'Holes'), tog('folds', 'Folds'), tog('labels', 'Labels'))),
@@ -301,6 +317,7 @@ class App {
         this.viewer.setResult(res, this.fitCameraNext);
         this.fitCameraNext = false;
         this.viewer.setExplode(parseFloat((this.refs.slider as HTMLInputElement).value));
+        this.reattachEditor();
         this.refreshLists();
         this.refreshPreview();
         const ms = Math.round(performance.now() - t0);
@@ -375,11 +392,14 @@ class App {
     this.tool = t;
     this.cutStart = null;
     this.viewer?.showPath([], []);
-    for (const k of ['select', 'cut', 'move', 'join', 'seamtype'] as Tool[]) this.refs['tool_' + k].classList.toggle('active', k === t);
+    for (const k of ['select', 'cut', 'move', 'points', 'join', 'seamtype'] as Tool[]) this.refs['tool_' + k].classList.toggle('active', k === t);
+    if (t !== 'points') this.stopEditingPoints();
+    this.refs.pointActions.style.display = t === 'points' ? '' : 'none';
     const tips: Record<Tool, string> = {
       select: 'Select: click a piece or a seam to inspect it. Drag to orbit, wheel to zoom, right-drag to pan.',
       cut: 'Cut: press on the model, drag, release (or click two points). A seam follows the shortest surface path; other seams stay where they are.',
       move: 'Move: press on a seam and drag. The seam re-routes through the pointer, keeping its two ends; release to apply. Right-drag orbits.',
+      points: 'Points: click a seam to show its points. Click a point (shift-click to add), drag selected points together, Delete removes them, S smooths them, A selects all. Grey end points are junctions and stay fixed.',
       join: 'Join: click near a seam to remove it. If the merged piece exceeds the leather stretch limit it is flagged so you can place a better seam.',
       seamtype: 'Seam type: click near a seam to toggle it between turned (allowance added) and butted (holes inset from the cut edge).',
     };
@@ -394,6 +414,12 @@ class App {
       case 'select':
         this.select(nearSeam === null ? p.patchId : null, nearSeam);
         break;
+      case 'points': {
+        if (p.handle !== undefined) { this.clickHandle(p.handle, !!p.shift); break; }
+        if (nearSeam !== null) this.startEditingPoints(nearSeam);
+        else this.stopEditingPoints();
+        break;
+      }
       case 'cut': {
         if (this.cutStart === null) {
           this.cutStart = p.vertex;
@@ -428,8 +454,155 @@ class App {
   }
 
   // ───────────────────────── drag editing
-  private drag: { kind: 'cut'; start: number } | { kind: 'move'; seamId: number; a: number; b: number; oldEdges: number[] } | null = null;
+  private drag: { kind: 'cut'; start: number } | { kind: 'move'; seamId: number; a: number; b: number; oldEdges: number[] } | { kind: 'points'; primary: number; startVertex: number; startPos: Map<number, V3>; moved: boolean; shift: boolean } | null = null;
   private dragPath: number[] = [];
+  /** seam point editing state (Points tool) */
+  private edit: { seamId: number; handles: number[]; selected: Set<number>; pendingEdges: number[] | null } | null = null;
+  private tentativeHandles: number[] | null = null;
+
+  private vertexPos(v: number): V3 {
+    const P = this.result!.topo.mesh.positions;
+    return [P[3 * v], P[3 * v + 1], P[3 * v + 2]];
+  }
+
+  private nearestVertex(p: V3): number {
+    const P = this.result!.topo.mesh.positions;
+    let best = 0, bd = Infinity;
+    for (let v = 0; v < this.result!.topo.mesh.nv; v++) {
+      const d = (P[3 * v] - p[0]) ** 2 + (P[3 * v + 1] - p[1]) ** 2 + (P[3 * v + 2] - p[2]) ** 2;
+      if (d < bd) { bd = d; best = v; }
+    }
+    return best;
+  }
+
+  /** Handles for a seam: its shape-defining vertices (simplified chain), topped up to a usable density. */
+  private chooseHandles(seamId: number): number[] {
+    const seam = this.result!.pattern.seams[seamId];
+    const verts = this.pathVertices(seam.origEdges);
+    if (verts.length < 2) return verts;
+    const pts = verts.map((v) => this.vertexPos(v));
+    const lens: number[] = [];
+    for (let i = 1; i < pts.length; i++) lens.push(Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1], pts[i][2] - pts[i - 1][2]));
+    const median = lens.slice().sort((a, b) => a - b)[Math.floor(lens.length / 2)] || 1;
+    const keep = new Set(simplifyIndices(pts, 1.5 * median));
+    // top up so there is a handle at least every ~1/8 of the seam
+    const target = Math.max(2, Math.min(verts.length, 9));
+    if (keep.size < target) for (let k = 0; k < target; k++) keep.add(Math.round((k / (target - 1)) * (verts.length - 1)));
+    return Array.from(keep).sort((a, b) => a - b).map((i) => verts[i]);
+  }
+
+  private startEditingPoints(seamId: number): void {
+    this.edit = { seamId, handles: this.chooseHandles(seamId), selected: new Set(), pendingEdges: null };
+    this.select(null, seamId);
+    this.refreshHandles();
+  }
+
+  private stopEditingPoints(): void {
+    if (!this.edit) return;
+    this.edit = null;
+    this.viewer?.setHandles([], new Set(), new Set());
+  }
+
+  private refreshHandles(): void {
+    if (!this.edit) return;
+    const n = this.edit.handles.length;
+    this.viewer.setHandles(this.edit.handles, this.edit.selected, new Set([0, n - 1]));
+  }
+
+  private clickHandle(i: number, shift: boolean): void {
+    if (!this.edit) return;
+    const n = this.edit.handles.length;
+    if (i === 0 || i === n - 1) { this.setStatus('End points are junctions with other seams and stay fixed.'); return; }
+    if (shift) { if (this.edit.selected.has(i)) this.edit.selected.delete(i); else this.edit.selected.add(i); }
+    else { this.edit.selected.clear(); this.edit.selected.add(i); }
+    this.refreshHandles();
+    this.setStatus(`${this.edit.selected.size} point(s) selected. Drag to move, Delete to remove, S to smooth.`);
+  }
+
+  private selectAllPoints(): void {
+    if (!this.edit) return;
+    for (let i = 1; i < this.edit.handles.length - 1; i++) this.edit.selected.add(i);
+    this.refreshHandles();
+  }
+
+  private deletePoints(): void {
+    if (!this.edit || !this.edit.selected.size) return;
+    const n = this.edit.handles.length;
+    this.edit.handles = this.edit.handles.filter((_, i) => i === 0 || i === n - 1 || !this.edit!.selected.has(i));
+    this.edit.selected.clear();
+    this.rebuildEditedSeam();
+  }
+
+  private smoothPoints(): void {
+    if (!this.edit) return;
+    const h = this.edit.handles;
+    const n = h.length;
+    if (n < 3) return;
+    const targets = this.edit.selected.size ? Array.from(this.edit.selected) : Array.from({ length: n - 2 }, (_, i) => i + 1);
+    const pos = h.map((v) => this.vertexPos(v));
+    const next = h.slice();
+    for (const i of targets) {
+      if (i <= 0 || i >= n - 1) continue;
+      const q: V3 = [0, 1, 2].map((k) => (pos[i - 1][k] + 2 * pos[i][k] + pos[i + 1][k]) / 4) as V3;
+      next[i] = this.nearestVertex(q);
+    }
+    this.edit.handles = next;
+    this.rebuildEditedSeam();
+  }
+
+  private densifyPoints(): void {
+    if (!this.edit) return;
+    const seam = this.result!.pattern.seams[this.edit.seamId];
+    const verts = this.pathVertices(seam.origEdges);
+    const idx = this.edit.handles.map((v) => verts.indexOf(v)).filter((i) => i >= 0).sort((a, b) => a - b);
+    const out = new Set<number>(idx);
+    for (let k = 0; k < idx.length - 1; k++) if (idx[k + 1] - idx[k] >= 2) out.add(Math.floor((idx[k] + idx[k + 1]) / 2));
+    this.edit.handles = Array.from(out).sort((a, b) => a - b).map((i) => verts[i]);
+    this.edit.selected.clear();
+    this.refreshHandles();
+  }
+
+  /** Re-route the edited seam through its handles (shortest paths between consecutive handles). */
+  private rebuildEditedSeam(): void {
+    if (!this.edit || !this.result) return;
+    const seam = this.result.pattern.seams[this.edit.seamId];
+    const edges: number[] = [];
+    const h = this.edit.handles;
+    for (let i = 0; i < h.length - 1; i++) {
+      if (h[i] === h[i + 1]) continue;
+      const path = shortestEdgePath(this.result.topo, h[i], h[i + 1]);
+      if (!path.length) { this.setStatus('Could not route the seam between two points.', true); return; }
+      edges.push(...path);
+    }
+    if (!edges.length) return;
+    this.freezeSeams(seam.id);
+    for (const e of seam.origEdges) { this.settings.forcedSeamEdges.delete(e); this.settings.forbiddenSeamEdges.add(e); }
+    for (const e of edges) { this.settings.forbiddenSeamEdges.delete(e); this.settings.forcedSeamEdges.add(e); }
+    this.edit.pendingEdges = edges;
+    this.recompute('full');
+  }
+
+  /** After a recompute, re-attach the editor to the rebuilt seam. */
+  private reattachEditor(): void {
+    if (!this.edit || !this.result) return;
+    const target = this.edit.pendingEdges ? new Set(this.edit.pendingEdges) : new Set(this.result.pattern.seams[this.edit.seamId]?.origEdges ?? []);
+    let best: { id: number; hits: number } | null = null;
+    for (const s of this.result.pattern.seams) {
+      let hits = 0;
+      for (const e of s.origEdges) if (target.has(e)) hits++;
+      if (hits && (!best || hits > best.hits)) best = { id: s.id, hits };
+    }
+    if (!best) { this.stopEditingPoints(); return; }
+    this.edit.seamId = best.id;
+    this.edit.pendingEdges = null;
+    // keep only handles that still lie on the seam
+    const onSeam = new Set(this.pathVertices(this.result.pattern.seams[best.id].origEdges));
+    this.edit.handles = this.edit.handles.filter((v) => onSeam.has(v));
+    if (this.edit.handles.length < 3) this.edit.handles = this.chooseHandles(best.id);
+    this.edit.selected.clear();
+    this.select(null, best.id);
+    this.refreshHandles();
+  }
 
   /** Pin every current seam so an edit changes only what the user touched. */
   private freezeSeams(exceptSeam: number | null = null): void {
@@ -455,6 +628,15 @@ class App {
 
   private onDragStart(p: PickInfo): boolean {
     if (!this.result) return false;
+    if (this.tool === 'points') {
+      if (p.handle === undefined || !this.edit) return false;
+      const n = this.edit.handles.length;
+      if (p.handle === 0 || p.handle === n - 1) return false;
+      // selection is decided on the first real move (or on release, as a click)
+      this.drag = { kind: 'points', primary: p.handle, startVertex: this.edit.handles[p.handle], startPos: new Map(), moved: false, shift: !!p.shift };
+      this.tentativeHandles = null;
+      return true;
+    }
     if (this.tool === 'cut') {
       this.drag = { kind: 'cut', start: p.vertex };
       this.dragPath = [];
@@ -477,6 +659,30 @@ class App {
 
   private onDragMove(p: PickInfo | null): void {
     if (!this.drag || !this.result || !p) return;
+    if (this.drag.kind === 'points') {
+      if (!this.edit || p.vertex < 0) return;
+      const d = this.drag;
+      if (p.vertex === d.startVertex && !d.moved) return;
+      if (!d.moved) {
+        // first real move: make sure the dragged handle is part of the selection
+        if (!this.edit.selected.has(d.primary)) { if (!d.shift) this.edit.selected.clear(); this.edit.selected.add(d.primary); this.refreshHandles(); }
+        for (const i of this.edit.selected) d.startPos.set(i, this.vertexPos(this.edit.handles[i]));
+      }
+      d.moved = true;
+      const from = this.vertexPos(d.startVertex), to = this.vertexPos(p.vertex);
+      const delta: V3 = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+      const handles = this.edit.handles.slice();
+      for (const [i, sp] of d.startPos) handles[i] = i === d.primary ? p.vertex : this.nearestVertex([sp[0] + delta[0], sp[1] + delta[1], sp[2] + delta[2]]);
+      this.tentativeHandles = handles;
+      const verts: number[] = [];
+      for (let i = 0; i < handles.length - 1; i++) {
+        const path = shortestEdgePath(this.result.topo, handles[i], handles[i + 1]);
+        const pv = this.pathVertices(path);
+        verts.push(...(verts.length ? pv.slice(1) : pv));
+      }
+      this.viewer.showPath(verts, Array.from(d.startPos.keys()).map((i) => handles[i]));
+      return;
+    }
     if (this.drag.kind === 'cut') {
       this.dragPath = shortestEdgePath(this.result.topo, this.drag.start, p.vertex);
       this.viewer.showPath(this.pathVertices(this.dragPath), [this.drag.start, p.vertex]);
@@ -494,6 +700,14 @@ class App {
     this.drag = null;
     this.viewer.showPath([], []);
     if (!d || !this.result) return;
+    if (d.kind === 'points') {
+      if (!this.edit) return;
+      if (!d.moved || !this.tentativeHandles) { this.clickHandle(d.primary, !!(p && p.shift)); return; }
+      this.edit.handles = this.tentativeHandles;
+      this.tentativeHandles = null;
+      this.rebuildEditedSeam();
+      return;
+    }
     if (d.kind === 'cut') {
       if (!p || p.vertex === d.start) {
         // treated as a click: fall back to the two-click flow

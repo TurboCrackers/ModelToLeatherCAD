@@ -13,6 +13,9 @@ export interface PickInfo {
   vertex: number;
   point: V3;
   nearestSeam: { id: number; dist: number } | null;
+  /** index of a seam-editing handle under the pointer, if any */
+  handle?: number;
+  shift?: boolean;
 }
 
 export interface ViewerVisibility {
@@ -43,6 +46,9 @@ export class Viewer {
   private pathLine: THREE.Line | null = null;
   private highlightLine: THREE.LineSegments | null = null;
   private markers: THREE.Mesh[] = [];
+  private handleGroup = new THREE.Group();
+  private handleMeshes: THREE.Mesh[] = [];
+  private handleVerts: number[] = [];
   private res: PipelineResult | null = null;
   private explode = 0;
   private visibility: ViewerVisibility = { seams: true, holes: true, folds: true, labels: true };
@@ -91,6 +97,7 @@ export class Viewer {
     dir2.position.set(-2, -1, -1);
     this.scene.add(dir2);
     this.scene.add(this.root);
+    this.scene.add(this.handleGroup);
     const ro = new ResizeObserver(() => this.resize());
     ro.observe(container);
     this.resize();
@@ -122,6 +129,16 @@ export class Viewer {
     const ndc = new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
     const ray = new THREE.Raycaster();
     ray.setFromCamera(ndc, this.camera);
+    // editing handles take priority over the surface
+    if (this.handleMeshes.length) {
+      this.handleGroup.updateMatrixWorld(true);
+      const hh = ray.intersectObjects(this.handleMeshes, false);
+      if (hh.length) {
+        const idx = this.handleMeshes.indexOf(hh[0].object as THREE.Mesh);
+        const pt = hh[0].point;
+        return { face: -1, patchId: -1, vertex: this.handleVerts[idx], point: [pt.x, pt.y, pt.z], nearestSeam: null, handle: idx };
+      }
+    }
     const hits = ray.intersectObject(this.mesh, false);
     if (!hits.length || hits[0].faceIndex === undefined || hits[0].faceIndex === null) return null;
     const face = hits[0].faceIndex as number;
@@ -155,6 +172,7 @@ export class Viewer {
       down = [e.clientX, e.clientY];
       if (this.onDragStart) {
         const p = this.pickAt(e.clientX, e.clientY);
+        if (p) p.shift = e.shiftKey;
         if (p && this.onDragStart(p)) {
           dragging = true;
           this.controls.enabled = false;
@@ -171,7 +189,9 @@ export class Viewer {
         dragging = false;
         this.controls.enabled = true;
         try { el.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
-        this.onDragEnd?.(this.pickAt(e.clientX, e.clientY));
+        const pe = this.pickAt(e.clientX, e.clientY);
+        if (pe) pe.shift = e.shiftKey;
+        this.onDragEnd?.(pe);
         down = null;
         return;
       }
@@ -180,7 +200,33 @@ export class Viewer {
       down = null;
       if (moved > 4 || !this.onPick) return;
       const p = this.pickAt(e.clientX, e.clientY);
-      if (p) this.onPick(p);
+      if (p) { p.shift = e.shiftKey; this.onPick(p); }
+    });
+  }
+
+  /** Show draggable seam-editing handles at original vertices. */
+  setHandles(origVerts: number[], selected: Set<number>, fixed: Set<number>): void {
+    this.handleGroup.clear();
+    this.handleMeshes = [];
+    this.handleVerts = origVerts.slice();
+    const rad = this.modelSize * 0.02;
+    origVerts.forEach((_, i) => {
+      const color = fixed.has(i) ? 0x9aa3b2 : selected.has(i) ? 0x00ff88 : 0xffd166;
+      const m = new THREE.Mesh(new THREE.SphereGeometry(rad, 12, 8), new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.95 }));
+      m.renderOrder = 30;
+      this.handleGroup.add(m);
+      this.handleMeshes.push(m);
+    });
+    this.updateHandlePositions();
+    this.needsRender = true;
+  }
+
+  private updateHandlePositions(): void {
+    if (!this.res) return;
+    this.handleMeshes.forEach((m, i) => {
+      const cv = this.origToCut.get(this.handleVerts[i]);
+      if (cv === undefined) return;
+      m.position.set(this.cur[3 * cv], this.cur[3 * cv + 1], this.cur[3 * cv + 2]);
     });
   }
 
@@ -487,6 +533,7 @@ export class Viewer {
       sp.position.set(x / vs.length, y / vs.length + this.modelSize * 0.02, z / vs.length);
     });
     this.updateHighlightLine();
+    this.updateHandlePositions();
     this.needsRender = true;
   }
 }

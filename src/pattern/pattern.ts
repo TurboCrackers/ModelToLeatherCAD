@@ -1,7 +1,7 @@
 import { MeshTopology, CutMesh, otherFace } from '../geometry/mesh';
 import { SegmentationResult, Patch, EDGE_FOLD } from '../geometry/segmentation';
 import { LeatherSpec, SeamType } from '../leather/physics';
-import { V2, V3, add2, scale2, perp2, len2, sub3, add3, scale3, norm3, dot3, lerp3 } from '../geometry/vec';
+import { V2, V3, add2, scale2, perp2, len2, sub3, add3, scale3, norm3 } from '../geometry/vec';
 import { signedArea, polygonCentroid, offsetPolygon, polygonSelfIntersects, removeSelfIntersections, pointAtArc } from './geometry2d';
 import { planSmoothing, applySmoothing, SmoothPlan, polylineLength, arcFractions, pointAtFraction } from './smooth';
 
@@ -325,6 +325,15 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     }
   }));
 
+  // Display-only lift so smoothed curves and hole markers sit just outside the surface
+  // (a smooth curve through surface points is a chord and would be hidden by the mesh).
+  let dmin = [Infinity, Infinity, Infinity], dmax = [-Infinity, -Infinity, -Infinity];
+  for (let v = 0; v < topo.mesh.nv; v++) for (let k = 0; k < 3; k++) { dmin[k] = Math.min(dmin[k], display[3 * v + k]); dmax[k] = Math.max(dmax[k], display[3 * v + k]); }
+  const modelSize = Math.max(dmax[0] - dmin[0], dmax[1] - dmin[1], dmax[2] - dmin[2]) || 1;
+  const liftLine = 0.004 * modelSize, liftHole = 0.007 * modelSize;
+  const N3 = (cv: number): V3 => { const ov = cut.origVertex[cv]; return [topo.vertexNormals[3 * ov], topo.vertexNormals[3 * ov + 1], topo.vertexNormals[3 * ov + 2]]; };
+  const liftAlong = (pts: V3[], normals: V3[], amount: number): V3[] => pts.map((q, i) => { const n = norm3(normals[Math.min(i, normals.length - 1)]); return add3(q, scale3(n, amount)); });
+
   // ---- per piece: smoothed runs → outlines, allowance, holes, folds, labels
   for (const pc of pieces) {
     const li = pc.patch.flat.localIndex;
@@ -368,8 +377,12 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
           for (const e of chainEdges) c2.push(P(isA ? e.to : e.from));
           const s2 = applySmoothing(c2, sm.plan) as V2[];
           const s3 = sm.smoothDisplay;
+          const cN: V3[] = [N3(isA ? chainEdges[0].from : chainEdges[0].to)];
+          for (const e of chainEdges) cN.push(N3(isA ? e.to : e.from));
+          const sN = applySmoothing(cN, sm.plan) as V3[];
+          const s3l = liftAlong(s3, sN, liftLine);
           pts2 = isA ? s2 : s2.slice().reverse();
-          pts3 = isA ? s3 : s3.slice().reverse();
+          pts3 = isA ? s3l : s3l.slice().reverse();
           // holes for this side, positioned by arc fraction of the shared smoothed chain
           const L2 = polylineLength(s2), L3 = sm.length || 1;
           for (const sArc of sm.holeArc) {
@@ -377,22 +390,8 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
             const left = perp2(dir);
             const inward = isA ? left : scale2(left, -1);
             const p2 = add2(p, scale2(inward, sm.insetMm));
-            // 3D: point on the smooth display curve, nudged toward the piece side
-            let acc = 0, i3 = 0;
-            for (; i3 < s3.length - 2; i3++) { const l = Math.hypot(...sub3(s3[i3 + 1], s3[i3])); if (acc + l >= sArc) break; acc += l; }
-            const segL = Math.hypot(...sub3(s3[i3 + 1], s3[i3])) || 1;
-            const f = Math.min(1, Math.max(0, (sArc - acc) / segL));
-            const base = lerp3(s3[i3], s3[i3 + 1], f);
-            const ref = chainEdges[Math.min(chainEdges.length - 1, Math.floor((sArc / L3) * chainEdges.length))];
-            const fc: V3 = [ct.faceCentroids[3 * ref.face], ct.faceCentroids[3 * ref.face + 1], ct.faceCentroids[3 * ref.face + 2]];
-            const cvs = [ct.mesh.indices[3 * ref.face], ct.mesh.indices[3 * ref.face + 1], ct.mesh.indices[3 * ref.face + 2]];
-            const cd: V3 = [0, 0, 0];
-            for (const cv of cvs) { const d = D(cv); cd[0] += d[0] / 3; cd[1] += d[1] / 3; cd[2] += d[2] / 3; }
-            void fc;
-            const tdir = norm3(sub3(s3[i3 + 1], s3[i3]));
-            let w = sub3(cd, base);
-            w = norm3(sub3(w, scale3(tdir, dot3(w, tdir))));
-            pc.holes.push({ seamId, p: p2, p3: add3(base, scale3(w, sm.insetMm)) });
+            // 3D marker: map the 2D hole back onto the surface through the flattening (filled in below)
+            pc.holes.push({ seamId, p: p2, p3: [0, 0, 0] });
           }
           // label and notches
           const mid = pointAtArc(s2, L2 / 2);
@@ -408,11 +407,14 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
           const c3: V3[] = [D(edges[0].from)];
           for (const e of edges) { c2.push(P(e.to)); c3.push(D(e.to)); }
           const plan = opts.smoothCutLines ? planSmoothing(c3) : identityPlan(c3.length);
+          const cN: V3[] = [N3(edges[0].from)];
+          for (const e of edges) cN.push(N3(e.to));
           pts2 = applySmoothing(c2, plan) as V2[];
-          pts3 = applySmoothing(c3, plan) as V3[];
+          pts3 = liftAlong(applySmoothing(c3, plan) as V3[], applySmoothing(cN, plan) as V3[], liftLine);
         }
         pc.runs.push({ seamId, pts2, pts3 });
-        // snap the mesh boundary vertices of this run onto the smooth curves (loop order)
+        // snap the mesh boundary vertices of this run onto the smooth curves (loop order); the
+        // display curve is lifted slightly off the surface, so pull the snapped vertices back down
         {
           const verts: number[] = [edges[0].from];
           for (const e of edges) verts.push(e.to);
@@ -422,7 +424,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
             const q2 = pointAtFraction(pts2, fr[j]) as V2;
             const q3 = pointAtFraction(pts3, fr[j]) as V3;
             uvSnap.set(cv, q2);
-            pc.boundaryDisplay.set(cv, q3);
+            pc.boundaryDisplay.set(cv, add3(q3, scale3(norm3(N3(cv)), -liftLine)));
           });
         }
         const allowance = seamId >= 0 ? seams[seamId].allowanceMm : opts.rawEdgeAllowanceMm;
@@ -435,6 +437,36 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     pc.outlines = newOutlines;
     pc.cutOutlines = newCut;
     if (opts.smoothCutLines) for (const [cv, q] of uvSnap) { const l = li.get(cv)!; pc.uv[2 * l] = q[0]; pc.uv[2 * l + 1] = q[1]; }
+    // 3D hole markers: locate each 2D hole in the flattened triangles and lift the matching surface point
+    {
+      const uv = pc.uv;
+      const faces = pc.patch.faces;
+      const tri = (f: number) => [0, 1, 2].map((k) => ct.mesh.indices[3 * f + k]);
+      const uvOf = (cv: number): V2 => { const l = li.get(cv)!; return [uv[2 * l], uv[2 * l + 1]]; };
+      for (const h of pc.holes) {
+        let best: { f: number; b: [number, number, number]; d: number } | null = null;
+        for (const f of faces) {
+          const [a, b, c] = tri(f).map(uvOf);
+          const det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+          if (Math.abs(det) < 1e-12) continue;
+          let l1 = ((b[0] - h.p[0]) * (c[1] - h.p[1]) - (c[0] - h.p[0]) * (b[1] - h.p[1])) / det;
+          let l2 = ((c[0] - h.p[0]) * (a[1] - h.p[1]) - (a[0] - h.p[0]) * (c[1] - h.p[1])) / det;
+          let l3 = 1 - l1 - l2;
+          // distance outside the triangle (0 if inside)
+          const d = Math.max(0, -l1, -l2, -l3);
+          if (!best || d < best.d) {
+            if (d > 0) { l1 = Math.max(0, l1); l2 = Math.max(0, l2); l3 = Math.max(0, l3); const sum = l1 + l2 + l3 || 1; l1 /= sum; l2 /= sum; l3 /= sum; }
+            best = { f, b: [l1, l2, l3], d };
+            if (d === 0) break;
+          }
+        }
+        if (!best) continue;
+        const [a, b, c] = tri(best.f).map(D);
+        const fn: V3 = norm3([ct.faceNormals[3 * best.f], ct.faceNormals[3 * best.f + 1], ct.faceNormals[3 * best.f + 2]]);
+        const q: V3 = [0, 1, 2].map((k) => a[k] * best!.b[0] + b[k] * best!.b[1] + c[k] * best!.b[2]) as V3;
+        h.p3 = add3(q, scale3(fn, liftHole));
+      }
+    }
     const outerIdx = pc.loops.findIndex((l) => l.isOuter);
     if (outerIdx >= 0 && newOutlines[outerIdx]) {
       pc.areaMm2 = Math.abs(signedArea(newOutlines[outerIdx])) - newOutlines.filter((_, j) => j !== outerIdx).reduce((a, o) => a + Math.abs(signedArea(o)), 0);
