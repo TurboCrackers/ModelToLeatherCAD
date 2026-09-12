@@ -26,6 +26,15 @@ function bestRotation(outline: V2[]): { angle: number; w: number; h: number; min
   // refine around the coarse optimum so rectangles land square on the page
   const coarse = (best.angle * 180) / Math.PI;
   for (let deg = coarse - 5; deg <= coarse + 5; deg += 0.25) evaluate(deg);
+  // prefer aligning the longest straight edge with the page when it costs almost nothing
+  let longest = 0, longAngle = 0;
+  for (let i = 0; i < outline.length; i++) {
+    const a = outline[i], b = outline[(i + 1) % outline.length];
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (L > longest) { longest = L; longAngle = -Math.atan2(b[1] - a[1], b[0] - a[0]); }
+  }
+  const bb = bbox(outline.map((p) => rotate2(p, longAngle)));
+  if (bb.w * bb.h <= best.area * 1.04) best = { angle: longAngle, w: bb.w, h: bb.h, min: bb.min, area: bb.w * bb.h };
   return best;
 }
 

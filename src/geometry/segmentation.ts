@@ -132,7 +132,7 @@ function componentsOf(topo: MeshTopology, faces: Iterable<number>, canCross: (ed
 }
 
 /** Multi-source Dijkstra over the given edges. */
-function dijkstra(topo: MeshTopology, sources: number[], allowedEdges: (e: number) => boolean, blockedVerts: Set<number>): { dist: Map<number, number>; prev: Map<number, number> } {
+function dijkstra(topo: MeshTopology, sources: number[], allowedEdges: (e: number) => boolean, blockedVerts: Set<number>, cost?: (e: number) => number): { dist: Map<number, number>; prev: Map<number, number> } {
   const dist = new Map<number, number>();
   const prev = new Map<number, number>();
   const heap: Array<[number, number]> = [];
@@ -173,7 +173,7 @@ function dijkstra(topo: MeshTopology, sources: number[], allowedEdges: (e: numbe
       const a = topo.edgeVerts[2 * e], b = topo.edgeVerts[2 * e + 1];
       const w = a === v ? b : a;
       if (blockedVerts.has(w)) continue;
-      const nd = d + topo.edgeLengths[e];
+      const nd = d + (cost ? cost(e) : topo.edgeLengths[e]);
       if (nd < (dist.get(w) ?? Infinity)) {
         dist.set(w, nd);
         prev.set(w, e);
@@ -501,6 +501,43 @@ function applyGoreSnap(orig: MeshTopology, params: SegmentationParams, snap: Gor
 }
 
 /**
+ * Polyhedron-style net: split the component into flat regions (faces connected across
+ * non-crease edges), build the region graph weighted by shared crease length, keep a
+ * maximum spanning tree of creases as folds and cut every other crease edge.
+ */
+function creaseNet(orig: MeshTopology, cut: CutMesh, params: SegmentationParams, faces: Int32Array, info: ComponentInfo): number[] | null {
+  const ct = cut.topo;
+  const creaseAngle = (params.creaseAngleDeg * Math.PI) / 180;
+  const isCrease = (e: number) => orig.dihedral[cut.origEdge[e]] >= creaseAngle;
+  const regions = componentsOf(ct, faces, (e) => !isCrease(e));
+  if (regions.length < 2) return null;
+  const regionOf = new Int32Array(ct.mesh.nf).fill(-1);
+  regions.forEach((r, i) => { for (const f of r) regionOf[f] = i; });
+  const pairs = new Map<string, { a: number; b: number; w: number; edges: number[] }>();
+  for (const e of info.interiorEdges) {
+    if (!isCrease(e) || params.forbiddenSeamEdges.has(cut.origEdge[e])) continue;
+    const a = regionOf[ct.edgeFaces[2 * e]], b = regionOf[ct.edgeFaces[2 * e + 1]];
+    if (a === b || a < 0 || b < 0) continue;
+    const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+    let p = pairs.get(key);
+    if (!p) pairs.set(key, (p = { a, b, w: 0, edges: [] }));
+    p.w += ct.edgeLengths[e];
+    p.edges.push(e);
+  }
+  if (!pairs.size) return null;
+  // Kruskal, longest shared creases first: those stay folds
+  const uf = new UnionFind(regions.length);
+  const sorted = Array.from(pairs.values()).sort((x, y) => y.w - x.w);
+  const cutEdges: number[] = [];
+  for (const p of sorted) {
+    if (uf.find(p.a) !== uf.find(p.b)) uf.union(p.a, p.b);
+    else cutEdges.push(...p.edges);
+  }
+  if (!cutEdges.length) return null;
+  return cutEdges.map((e) => cut.origEdge[e]);
+}
+
+/**
  * Decide where to cut a component that is not yet developable enough.
  * Returns ORIGINAL edge ids to add to the seam set.
  */
@@ -509,6 +546,16 @@ function chooseCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams,
   const info = componentInfo(ct, faces);
   const allowed = (e: number) => info.interiorEdges.has(e) && !params.forbiddenSeamEdges.has(cut.origEdge[e]);
   const toOrig = (edges: number[]) => edges.map((e) => cut.origEdge[e]);
+  // cuts should run along existing feature edges (creases) rather than across faces
+  const creaseAngle = (params.creaseAngleDeg * Math.PI) / 180;
+  const creaseCost = (e: number) => ct.edgeLengths[e] * (orig.dihedral[cut.origEdge[e]] >= creaseAngle ? 0.2 : 5);
+
+  // (0) closed shape made of flat regions joined by foldable creases: unfold it into one net by
+  // keeping a spanning tree of creases as folds and cutting the rest — no cuts across faces
+  if (info.boundaryVerts.size === 0 && params.canCreaseFold) {
+    const net = creaseNet(orig, cut, params, faces, info);
+    if (net) return net;
+  }
 
   if (info.boundaryVerts.size > 0) {
     // (a) concentrated curvature: dart from the worst interior vertex to the nearest boundary
@@ -522,7 +569,7 @@ function chooseCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams,
       if (d > worstDefect) { worstDefect = d; worst = cv; }
     }
     if (worst >= 0) {
-      const dj = dijkstra(ct, [worst], allowed, new Set());
+      const dj = dijkstra(ct, [worst], allowed, new Set(), creaseCost);
       let b = -1, bd = Infinity;
       for (const v of info.boundaryVerts) {
         const d = dj.dist.get(v);
@@ -539,7 +586,7 @@ function chooseCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams,
       if (g && g.ok) { for (const e of g.edges) goreEdges.add(e); if (g.snap) applyGoreSnap(orig, params, g.snap); return g.edges; }
     }
     // (b) distributed curvature: cut through the most central / most strained vertex to two sides
-    const fromBoundary = dijkstra(ct, Array.from(info.boundaryVerts), allowed, new Set());
+    const fromBoundary = dijkstra(ct, Array.from(info.boundaryVerts), allowed, new Set(), creaseCost);
     let maxD = 0;
     for (const [, d] of fromBoundary.dist) if (d > maxD) maxD = d;
     const strainSum = new Map<number, number>();
@@ -563,7 +610,7 @@ function chooseCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams,
       if (score > bs) { bs = score; best = v; }
     }
     if (best >= 0) {
-      const d1 = dijkstra(ct, [best], allowed, new Set());
+      const d1 = dijkstra(ct, [best], allowed, new Set(), creaseCost);
       let b1 = -1, bd = Infinity;
       for (const v of info.boundaryVerts) {
         const d = d1.dist.get(v);
@@ -572,7 +619,7 @@ function chooseCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams,
       if (b1 >= 0) {
         const p1 = pathEdges(ct, d1.prev, best, b1);
         const blocked = new Set(p1.verts.filter((v) => v !== best));
-        const d2 = dijkstra(ct, [best], allowed, blocked);
+        const d2 = dijkstra(ct, [best], allowed, blocked, creaseCost);
         const P = ct.mesh.positions;
         const B1 = [P[3 * b1], P[3 * b1 + 1], P[3 * b1 + 2]];
         let b2 = -1, bscore = -Infinity;
@@ -754,16 +801,18 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
           v = ot.edgeVerts[2 * e] === v ? ot.edgeVerts[2 * e + 1] : ot.edgeVerts[2 * e];
         }
       }
-      // max turning between consecutive chain edges
-      let maxTurn = 0;
+      // turning along the chain: a straight crease has none; a rim curves a little at every vertex
+      let maxTurn = 0, totalTurn = 0;
+      const chainSet = new Set(chain);
       for (const v of new Set(chain.flatMap((e) => [ot.edgeVerts[2 * e], ot.edgeVerts[2 * e + 1]]))) {
-        const es = creaseAt[v].filter((x) => chain.includes(x));
+        const es = creaseAt[v].filter((x) => chainSet.has(x));
         if (es.length !== 2) continue;
         const d1 = dir(es[0], v), d2 = dir(es[1], v);
         const turn = Math.PI - Math.acos(Math.max(-1, Math.min(1, d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2])));
         maxTurn = Math.max(maxTurn, turn);
+        totalTurn += turn;
       }
-      if (maxTurn > (8 * Math.PI) / 180) for (const e of chain) curvedOrig.add(e);
+      if (maxTurn > (8 * Math.PI) / 180 || totalTurn > (25 * Math.PI) / 180) for (const e of chain) curvedOrig.add(e);
     }
     if (curvedOrig.size) {
       if (ot === topo) { for (const e of curvedOrig) if (!params.forbiddenSeamEdges.has(e)) hard[e] = 1; }
