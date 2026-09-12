@@ -20,6 +20,20 @@ export interface PickInfo {
   shift?: boolean;
 }
 
+interface PieceAnim {
+  order: Int32Array; // faces, parents first
+  parent: Int32Array; // parent face per face in `order` (-1 for the root)
+  hingeA: Int32Array; // cut vertices of the hinge edge
+  hingeB: Int32Array;
+  hingeAngle: Float64Array; // rotation about (A→B) that lays the child flat on its parent
+  vertexOfPiece: Int32Array; // cut vertices belonging to the piece
+  explode: [number, number, number];
+  // rigid glide from the unfolded sheet (u = 1, exploded) to the layout: P' = c2 + R (P - c1)
+  c1: THREE.Vector3;
+  c2: THREE.Vector3;
+  quat: THREE.Quaternion;
+}
+
 export interface ViewerVisibility {
   seams: boolean;
   holes: boolean;
@@ -71,10 +85,16 @@ export class Viewer {
   private h1!: Float32Array;
   private h2!: Float32Array;
   private holeRadius = 1;
+  /** hinge-tree unfolding data per piece */
+  private anim: PieceAnim[] = [];
+  private holeFace: Int32Array = new Int32Array(0);
+  private holeBary: Float32Array = new Float32Array(0);
+  private lineFace: Int32Array = new Int32Array(0); // per seam-line endpoint
+  private lineBary: Float32Array = new Float32Array(0);
+  private liftLine = 0.5;
+  private liftHole = 0.8;
   private seamEdgeIds: number[] = []; // seam id per line segment
-  private line0!: Float32Array; // seam line segment endpoints, 3 states
-  private line1!: Float32Array;
-  private line2!: Float32Array;
+  private line0!: Float32Array; // seam line segment endpoints, assembled (fallback)
   private lineCur!: Float32Array;
   private foldEdgeVerts: number[] = [];
   private pieceVerts: number[][] = [];
@@ -349,7 +369,7 @@ export class Viewer {
         }
       }
     }
-    this.line0 = Float32Array.from(l0); this.line1 = Float32Array.from(l1); this.line2 = Float32Array.from(l2);
+    this.line0 = Float32Array.from(l0); void l1; void l2;
     for (let e = 0; e < ct.ne; e++) {
       const oe = cut.origEdge[e];
       if (ct.edgeFaces[2 * e + 1] >= 0 && seg.edgeClass[oe] === EDGE_FOLD) this.foldEdgeVerts.push(ct.edgeVerts[2 * e], ct.edgeVerts[2 * e + 1]);
@@ -406,6 +426,34 @@ export class Viewer {
       this.threadLines.visible = this.visibility.thread;
       this.root.add(this.threadLines);
     }
+    // per-hole and per-seam-line triangle attachments (animation carries them with the mesh)
+    this.holeFace = new Int32Array(nh).fill(-1);
+    this.holeBary = new Float32Array(3 * nh);
+    {
+      let i = 0;
+      for (const pc of pattern.pieces) for (const h of pc.holes) {
+        if (h.face !== undefined && h.bary) { this.holeFace[i] = h.face; this.holeBary.set(h.bary, 3 * i); }
+        i++;
+      }
+    }
+    {
+      const segs = this.seamEdgeIds.length;
+      this.lineFace = new Int32Array(2 * segs).fill(-1);
+      this.lineBary = new Float32Array(6 * segs);
+      let q = 0;
+      for (const pc of pattern.pieces) for (const run of pc.runs) {
+        for (let i = 0; i < run.pts2.length - 1; i++) {
+          for (const j of [i, i + 1]) {
+            const at = run.attach[j];
+            if (at) { this.lineFace[q] = at.face; this.lineBary.set(at.bary, 3 * q); }
+            q++;
+          }
+        }
+      }
+    }
+    this.liftLine = 0.004 * size;
+    this.liftHole = 0.007 * size;
+    this.anim = pattern.pieces.map((pc) => this.buildPieceAnim(pc.patch.faces, explodeDir[pc.id], explodeDist));
     // labels
     this.labels = pattern.pieces.map((pc) => {
       const sp = makeLabel(pc.name, patchColor(pc.id));
@@ -515,46 +563,196 @@ export class Viewer {
     this.needsRender = true;
   }
 
+  /** Build the hinge tree (BFS over shared edges from the most central face) and the glide frame. */
+  private buildPieceAnim(faces: Int32Array, dir: number[], dist: number): PieceAnim {
+    const ct = this.res!.seg.cut.topo;
+    const idx = ct.mesh.indices;
+    const inPiece = new Set<number>(Array.from(faces));
+    // centroid of the piece (assembled positions)
+    let cx = 0, cy = 0, cz = 0;
+    for (const f of faces) for (let k = 0; k < 3; k++) { const v = idx[3 * f + k]; cx += this.s0[3 * v]; cy += this.s0[3 * v + 1]; cz += this.s0[3 * v + 2]; }
+    const n3 = faces.length * 3;
+    cx /= n3; cy /= n3; cz /= n3;
+    let root = faces[0], bd = Infinity;
+    for (const f of faces) {
+      let fx = 0, fy = 0, fz = 0;
+      for (let k = 0; k < 3; k++) { const v = idx[3 * f + k]; fx += this.s0[3 * v] / 3; fy += this.s0[3 * v + 1] / 3; fz += this.s0[3 * v + 2] / 3; }
+      const d = (fx - cx) ** 2 + (fy - cy) ** 2 + (fz - cz) ** 2;
+      if (d < bd) { bd = d; root = f; }
+    }
+    const order: number[] = [root];
+    const parent = new Map<number, number>([[root, -1]]);
+    const hinge = new Map<number, [number, number]>();
+    for (let head = 0; head < order.length; head++) {
+      const f = order[head];
+      for (let k = 0; k < 3; k++) {
+        const e = ct.faceEdges[3 * f + k];
+        const g = otherFace(ct, e, f);
+        if (g < 0 || !inPiece.has(g) || parent.has(g)) continue;
+        parent.set(g, f);
+        hinge.set(g, [idx[3 * f + k], idx[3 * f + ((k + 1) % 3)]]);
+        order.push(g);
+      }
+    }
+    const normal = (f: number): THREE.Vector3 => {
+      const a = idx[3 * f], b = idx[3 * f + 1], c = idx[3 * f + 2];
+      const A = new THREE.Vector3(this.s0[3 * a], this.s0[3 * a + 1], this.s0[3 * a + 2]);
+      const B = new THREE.Vector3(this.s0[3 * b], this.s0[3 * b + 1], this.s0[3 * b + 2]);
+      const C = new THREE.Vector3(this.s0[3 * c], this.s0[3 * c + 1], this.s0[3 * c + 2]);
+      return B.sub(A).cross(C.sub(A)).normalize();
+    };
+    const orderArr = Int32Array.from(order);
+    const parentArr = new Int32Array(order.length), hA = new Int32Array(order.length), hB = new Int32Array(order.length);
+    const angle = new Float64Array(order.length);
+    order.forEach((f, i) => {
+      const p = parent.get(f)!;
+      parentArr[i] = p;
+      if (p < 0) return;
+      const [va, vb] = hinge.get(f)!;
+      hA[i] = va; hB[i] = vb;
+      const d = new THREE.Vector3(this.s0[3 * vb] - this.s0[3 * va], this.s0[3 * vb + 1] - this.s0[3 * va + 1], this.s0[3 * vb + 2] - this.s0[3 * va + 2]).normalize();
+      const nc = normal(f), np = normal(p);
+      // rotation about d taking the child's normal onto the parent's
+      angle[i] = Math.atan2(new THREE.Vector3().crossVectors(nc, np).dot(d), nc.dot(np));
+    });
+    const verts = new Set<number>();
+    for (const f of faces) for (let k = 0; k < 3; k++) verts.add(idx[3 * f + k]);
+    const vertexOfPiece = Int32Array.from(verts);
+    const anim: PieceAnim = { order: orderArr, parent: parentArr, hingeA: hA, hingeB: hB, hingeAngle: angle, vertexOfPiece, explode: [dir[0] * dist, dir[1] * dist, dir[2] * dist], c1: new THREE.Vector3(), c2: new THREE.Vector3(), quat: new THREE.Quaternion() };
+    // glide frame: unfolded sheet (u = 1, exploded) → layout
+    const U1 = new Float32Array(this.s0.length);
+    this.hingePositions(anim, 1, U1);
+    const c1 = new THREE.Vector3(), c2 = new THREE.Vector3();
+    for (const v of vertexOfPiece) { c1.x += U1[3 * v] + anim.explode[0]; c1.y += U1[3 * v + 1] + anim.explode[1]; c1.z += U1[3 * v + 2] + anim.explode[2]; c2.x += this.s2[3 * v]; c2.y += this.s2[3 * v + 1]; c2.z += this.s2[3 * v + 2]; }
+    c1.divideScalar(vertexOfPiece.length || 1); c2.divideScalar(vertexOfPiece.length || 1);
+    const n1 = normal(root);
+    let far = vertexOfPiece[0], fd = -1;
+    for (const v of vertexOfPiece) { const d = (U1[3 * v] + anim.explode[0] - c1.x) ** 2 + (U1[3 * v + 1] + anim.explode[1] - c1.y) ** 2 + (U1[3 * v + 2] + anim.explode[2] - c1.z) ** 2; if (d > fd) { fd = d; far = v; } }
+    const e1 = new THREE.Vector3(U1[3 * far] + anim.explode[0] - c1.x, U1[3 * far + 1] + anim.explode[1] - c1.y, U1[3 * far + 2] + anim.explode[2] - c1.z);
+    e1.addScaledVector(n1, -e1.dot(n1)).normalize();
+    const n2 = new THREE.Vector3(0, 1, 0);
+    const e2 = new THREE.Vector3(this.s2[3 * far] - c2.x, this.s2[3 * far + 1] - c2.y, this.s2[3 * far + 2] - c2.z);
+    e2.addScaledVector(n2, -e2.dot(n2)).normalize();
+    if (e1.lengthSq() < 0.5 || e2.lengthSq() < 0.5) { anim.c1.copy(c1); anim.c2.copy(c2); return anim; }
+    const f1 = new THREE.Matrix4().makeBasis(e1, new THREE.Vector3().crossVectors(n1, e1), n1);
+    const f2 = new THREE.Matrix4().makeBasis(e2, new THREE.Vector3().crossVectors(n2, e2), n2);
+    const R = f2.multiply(f1.clone().transpose());
+    anim.quat.setFromRotationMatrix(R);
+    anim.c1.copy(c1); anim.c2.copy(c2);
+    return anim;
+  }
+
+  /** Rigid-hinge positions at unfold parameter u (0 = assembled shape, 1 = flat), written into `out` (assembled frame). */
+  private hingePositions(anim: PieceAnim, u: number, out: Float32Array): void {
+    const ct = this.res!.seg.cut.topo;
+    const idx = ct.mesh.indices;
+    const pose = new Map<number, THREE.Matrix4>();
+    const acc = new Map<number, [number, number, number, number]>();
+    const m = new THREE.Matrix4(), rot = new THREE.Matrix4(), t1 = new THREE.Matrix4(), t2 = new THREE.Matrix4();
+    const axis = new THREE.Vector3(), pa = new THREE.Vector3(), q = new THREE.Vector3();
+    for (let i = 0; i < anim.order.length; i++) {
+      const f = anim.order[i], p = anim.parent[i];
+      let M: THREE.Matrix4;
+      if (p < 0) M = new THREE.Matrix4();
+      else {
+        const va = anim.hingeA[i], vb = anim.hingeB[i];
+        pa.set(this.s0[3 * va], this.s0[3 * va + 1], this.s0[3 * va + 2]);
+        axis.set(this.s0[3 * vb] - pa.x, this.s0[3 * vb + 1] - pa.y, this.s0[3 * vb + 2] - pa.z).normalize();
+        rot.makeRotationAxis(axis, u * anim.hingeAngle[i]);
+        t1.makeTranslation(-pa.x, -pa.y, -pa.z);
+        t2.makeTranslation(pa.x, pa.y, pa.z);
+        m.copy(t2).multiply(rot).multiply(t1); // rotate about the hinge line, in the assembled frame
+        M = pose.get(p)!.clone().multiply(m);
+      }
+      pose.set(f, M);
+      for (let k = 0; k < 3; k++) {
+        const v = idx[3 * f + k];
+        q.set(this.s0[3 * v], this.s0[3 * v + 1], this.s0[3 * v + 2]).applyMatrix4(M);
+        const a = acc.get(v);
+        if (a) { a[0] += q.x; a[1] += q.y; a[2] += q.z; a[3]++; } else acc.set(v, [q.x, q.y, q.z, 1]);
+      }
+    }
+    for (const [v, a] of acc) { out[3 * v] = a[0] / a[3]; out[3 * v + 1] = a[1] / a[3]; out[3 * v + 2] = a[2] / a[3]; }
+  }
+
   private updatePositions(): void {
     if (!this.res || !this.mesh) return;
     const t = this.explode;
     const a = t <= 1 ? smooth(t) : 1;
-    const b = t <= 1 ? 0 : smooth(t - 1);
     const n = this.cur.length;
-    for (let i = 0; i < n; i++) {
-      const e = this.s0[i] + (this.s1[i] - this.s0[i]) * a;
-      this.cur[i] = e + (this.s2[i] - e) * b;
+    if (t <= 1) {
+      for (let i = 0; i < n; i++) this.cur[i] = this.s0[i] + (this.s1[i] - this.s0[i]) * a;
+    } else {
+      // unfold: rigid triangles hinge open along their shared edges while the sheet glides to its layout spot
+      const u = smooth(Math.min(1, t - 1));
+      const w = u < 0.75 ? 0 : smooth((u - 0.75) / 0.25); // final blend removes the small forming strain
+      const tmp = new Float32Array(n);
+      const qI = new THREE.Quaternion();
+      const qu = new THREE.Quaternion(), pv = new THREE.Vector3();
+      for (const an of this.anim) {
+        this.hingePositions(an, u, tmp);
+        qu.copy(qI).slerp(an.quat, u);
+        for (const v of an.vertexOfPiece) {
+          pv.set(tmp[3 * v] + an.explode[0] - an.c1.x, tmp[3 * v + 1] + an.explode[1] - an.c1.y, tmp[3 * v + 2] + an.explode[2] - an.c1.z).applyQuaternion(qu);
+          const gx = an.c1.x + u * (an.c2.x - an.c1.x) + pv.x, gy = an.c1.y + u * (an.c2.y - an.c1.y) + pv.y, gz = an.c1.z + u * (an.c2.z - an.c1.z) + pv.z;
+          this.cur[3 * v] = gx + (this.s2[3 * v] - gx) * w;
+          this.cur[3 * v + 1] = gy + (this.s2[3 * v + 1] - gy) * w;
+          this.cur[3 * v + 2] = gz + (this.s2[3 * v + 2] - gz) * w;
+        }
+      }
     }
     (this.mesh.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
     this.mesh.geometry.computeVertexNormals();
     this.mesh.geometry.computeBoundingSphere();
-    // lines
-    const fill = (line: THREE.LineSegments | null, verts: number[]) => {
-      if (!line) return;
-      const arr = (line.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array;
-      for (let i = 0; i < verts.length; i++) { const v = verts[i]; arr[3 * i] = this.cur[3 * v]; arr[3 * i + 1] = this.cur[3 * v + 1]; arr[3 * i + 2] = this.cur[3 * v + 2]; }
-      (line.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
-      line.geometry.computeBoundingSphere();
+    const idx = this.res.seg.cut.topo.mesh.indices;
+    const faceNormal = (f: number, out: THREE.Vector3) => {
+      const a = idx[3 * f], b = idx[3 * f + 1], c = idx[3 * f + 2];
+      const ax = this.cur[3 * a], ay = this.cur[3 * a + 1], az = this.cur[3 * a + 2];
+      const ux = this.cur[3 * b] - ax, uy = this.cur[3 * b + 1] - ay, uz = this.cur[3 * b + 2] - az;
+      const vx = this.cur[3 * c] - ax, vy = this.cur[3 * c + 1] - ay, vz = this.cur[3 * c + 2] - az;
+      out.set(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx).normalize();
     };
+    const onFace = (f: number, b0: number, b1: number, b2: number, lift: number, out: THREE.Vector3) => {
+      const a = idx[3 * f], b = idx[3 * f + 1], c = idx[3 * f + 2];
+      faceNormal(f, out);
+      out.set(
+        this.cur[3 * a] * b0 + this.cur[3 * b] * b1 + this.cur[3 * c] * b2 + out.x * lift,
+        this.cur[3 * a + 1] * b0 + this.cur[3 * b + 1] * b1 + this.cur[3 * c + 1] * b2 + out.y * lift,
+        this.cur[3 * a + 2] * b0 + this.cur[3 * b + 2] * b1 + this.cur[3 * c + 2] * b2 + out.z * lift,
+      );
+    };
+    const tmpV = new THREE.Vector3();
+    // seam lines ride on their triangles
     if (this.seamLines) {
       const arr = (this.seamLines.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array;
-      for (let i = 0; i < arr.length; i++) {
-        const e = this.line0[i] + (this.line1[i] - this.line0[i]) * a;
-        arr[i] = e + (this.line2[i] - e) * b;
+      for (let q = 0; q < this.lineFace.length; q++) {
+        const f = this.lineFace[q];
+        if (f < 0) { arr[3 * q] = this.line0[3 * q]; arr[3 * q + 1] = this.line0[3 * q + 1]; arr[3 * q + 2] = this.line0[3 * q + 2]; continue; }
+        onFace(f, this.lineBary[3 * q], this.lineBary[3 * q + 1], this.lineBary[3 * q + 2], this.liftLine, tmpV);
+        arr[3 * q] = tmpV.x; arr[3 * q + 1] = tmpV.y; arr[3 * q + 2] = tmpV.z;
       }
       this.lineCur = arr;
       (this.seamLines.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
       this.seamLines.geometry.computeBoundingSphere();
     }
-    fill(this.foldLines, this.foldEdgeVerts);
-    // holes
+    // fold lines follow mesh edges
+    if (this.foldLines) {
+      const arr = (this.foldLines.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array;
+      for (let i = 0; i < this.foldEdgeVerts.length; i++) { const v = this.foldEdgeVerts[i]; arr[3 * i] = this.cur[3 * v]; arr[3 * i + 1] = this.cur[3 * v + 1]; arr[3 * i + 2] = this.cur[3 * v + 2]; }
+      (this.foldLines.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+      this.foldLines.geometry.computeBoundingSphere();
+    }
+    // holes ride on their triangles
     if (this.holes) {
       const m = new THREE.Matrix4();
       const nh = this.holes.count;
+      const hp = new Float32Array(3 * nh);
       for (let i = 0; i < nh; i++) {
-        const x0 = this.h0[3 * i] + (this.h1[3 * i] - this.h0[3 * i]) * a, y0 = this.h0[3 * i + 1] + (this.h1[3 * i + 1] - this.h0[3 * i + 1]) * a, z0 = this.h0[3 * i + 2] + (this.h1[3 * i + 2] - this.h0[3 * i + 2]) * a;
-        const x = x0 + (this.h2[3 * i] - x0) * b, y = y0 + (this.h2[3 * i + 1] - y0) * b, z = z0 + (this.h2[3 * i + 2] - z0) * b;
-        m.makeScale(this.holeRadius, this.holeRadius, this.holeRadius).setPosition(x, y, z);
+        const f = this.holeFace[i];
+        if (f >= 0) onFace(f, this.holeBary[3 * i], this.holeBary[3 * i + 1], this.holeBary[3 * i + 2], this.liftHole, tmpV);
+        else tmpV.set(this.h0[3 * i], this.h0[3 * i + 1], this.h0[3 * i + 2]);
+        hp[3 * i] = tmpV.x; hp[3 * i + 1] = tmpV.y; hp[3 * i + 2] = tmpV.z;
+        m.makeScale(this.holeRadius, this.holeRadius, this.holeRadius).setPosition(tmpV.x, tmpV.y, tmpV.z);
         this.holes.setMatrixAt(i, m);
       }
       this.holes.instanceMatrix.needsUpdate = true;
@@ -562,8 +760,7 @@ export class Viewer {
       if (this.threadLines) {
         // links between matched holes: shown while assembled, fading out over the first half of the explode
         const arr = (this.threadLines.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array;
-        const pos = (i: number, k: number) => { const e = this.h0[3 * i + k] + (this.h1[3 * i + k] - this.h0[3 * i + k]) * a; return e + (this.h2[3 * i + k] - e) * b; };
-        for (let q = 0; q < this.threadPairs.length; q++) for (let k = 0; k < 3; k++) arr[3 * q + k] = pos(this.threadPairs[q], k);
+        for (let q = 0; q < this.threadPairs.length; q++) for (let k = 0; k < 3; k++) arr[3 * q + k] = hp[3 * this.threadPairs[q] + k];
         (this.threadLines.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
         this.threadLines.geometry.computeBoundingSphere();
         const fade = Math.max(0, 1 - t / 0.5);

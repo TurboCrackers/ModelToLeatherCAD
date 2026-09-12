@@ -63,6 +63,8 @@ export interface PieceRun {
   pts2: V2[];
   /** matching points on the displayed 3D surface */
   pts3: V3[];
+  /** triangle + barycentric weights per point, for animation (parallel to pts2) */
+  attach: Array<{ face: number; bary: [number, number, number] }>;
 }
 
 export interface Hole {
@@ -74,6 +76,9 @@ export interface Hole {
   p: V2;
   /** 3D position on the displayed model surface */
   p3: V3;
+  /** triangle (cut-mesh face) and barycentric weights the hole rides on, for animation */
+  face?: number;
+  bary?: [number, number, number];
 }
 
 export interface Piece {
@@ -403,7 +408,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
           pts2 = applySmoothing(c2, plan) as V2[];
           pts3 = liftAlong(applySmoothing(c3, plan) as V3[], applySmoothing(cN, plan) as V3[], liftLine);
         }
-        pc.runs.push({ seamId, pts2, pts3 });
+        pc.runs.push({ seamId, pts2, pts3, attach: [] });
         run.pts2 = pts2; run.seamId = seamId;
         // snap the mesh boundary vertices of this run onto the smooth curves (loop order); the
         // display curve is lifted slightly off the surface, so pull the snapped vertices back down
@@ -531,35 +536,45 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
   for (const pc of pieces) {
     const li = pc.patch.flat.localIndex;
     const D = (cv: number): V3 => { const ov = cut.origVertex[cv]; return [display[3 * ov], display[3 * ov + 1], display[3 * ov + 2]]; };
-    // 3D hole markers: locate each 2D hole in the flattened triangles and lift the matching surface point
-    {
-      const uv = pc.uv;
-      const faces = pc.patch.faces;
-      const tri = (f: number) => [0, 1, 2].map((k) => ct.mesh.indices[3 * f + k]);
-      const uvOf = (cv: number): V2 => { const l = li.get(cv)!; return [uv[2 * l], uv[2 * l + 1]]; };
-      for (const h of pc.holes) {
-        let best: { f: number; b: [number, number, number]; d: number } | null = null;
-        for (const f of faces) {
-          const [a, b, c] = tri(f).map(uvOf);
-          const det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
-          if (Math.abs(det) < 1e-12) continue;
-          let l1 = ((b[0] - h.p[0]) * (c[1] - h.p[1]) - (c[0] - h.p[0]) * (b[1] - h.p[1])) / det;
-          let l2 = ((c[0] - h.p[0]) * (a[1] - h.p[1]) - (a[0] - h.p[0]) * (c[1] - h.p[1])) / det;
-          let l3 = 1 - l1 - l2;
-          // distance outside the triangle (0 if inside)
-          const d = Math.max(0, -l1, -l2, -l3);
-          if (!best || d < best.d) {
-            if (d > 0) { l1 = Math.max(0, l1); l2 = Math.max(0, l2); l3 = Math.max(0, l3); const sum = l1 + l2 + l3 || 1; l1 /= sum; l2 /= sum; l3 /= sum; }
-            best = { f, b: [l1, l2, l3], d };
-            if (d === 0) break;
-          }
+    // locate a piece-local 2D point in the flattened triangles (nearest triangle, clamped barycentrics)
+    const uv = pc.uv;
+    const faces = pc.patch.faces;
+    const tri = (f: number) => [0, 1, 2].map((k) => ct.mesh.indices[3 * f + k]);
+    const uvOf = (cv: number): V2 => { const l = li.get(cv)!; return [uv[2 * l], uv[2 * l + 1]]; };
+    const locate = (p2: V2): { f: number; b: [number, number, number] } | null => {
+      let best: { f: number; b: [number, number, number]; d: number } | null = null;
+      for (const f of faces) {
+        const [a, b, c] = tri(f).map(uvOf);
+        const det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+        if (Math.abs(det) < 1e-12) continue;
+        let l1 = ((b[0] - p2[0]) * (c[1] - p2[1]) - (c[0] - p2[0]) * (b[1] - p2[1])) / det;
+        let l2 = ((c[0] - p2[0]) * (a[1] - p2[1]) - (a[0] - p2[0]) * (c[1] - p2[1])) / det;
+        let l3 = 1 - l1 - l2;
+        const d = Math.max(0, -l1, -l2, -l3);
+        if (!best || d < best.d) {
+          if (d > 0) { l1 = Math.max(0, l1); l2 = Math.max(0, l2); l3 = Math.max(0, l3); const sum = l1 + l2 + l3 || 1; l1 /= sum; l2 /= sum; l3 /= sum; }
+          best = { f, b: [l1, l2, l3], d };
+          if (d === 0) break;
         }
-        if (!best) continue;
-        const [a, b, c] = tri(best.f).map(D);
-        const fn: V3 = norm3([ct.faceNormals[3 * best.f], ct.faceNormals[3 * best.f + 1], ct.faceNormals[3 * best.f + 2]]);
-        const q: V3 = [0, 1, 2].map((k) => a[k] * best!.b[0] + b[k] * best!.b[1] + c[k] * best!.b[2]) as V3;
-        h.p3 = add3(q, scale3(fn, liftHole));
       }
+      return best;
+    };
+    const surfacePoint = (f: number, bw: [number, number, number], lift: number): V3 => {
+      const [a, b, c] = tri(f).map(D);
+      const fn: V3 = norm3([ct.faceNormals[3 * f], ct.faceNormals[3 * f + 1], ct.faceNormals[3 * f + 2]]);
+      const q: V3 = [0, 1, 2].map((k) => a[k] * bw[0] + b[k] * bw[1] + c[k] * bw[2]) as V3;
+      return add3(q, scale3(fn, lift));
+    };
+    // 3D hole markers: the 2D hole mapped back onto the surface
+    for (const h of pc.holes) {
+      const loc = locate(h.p);
+      if (!loc) continue;
+      h.face = loc.f; h.bary = loc.b;
+      h.p3 = surfacePoint(loc.f, loc.b, liftHole);
+    }
+    // seam / raw-edge curves: attach every point to a triangle so the animation can carry them
+    for (const run of pc.runs) {
+      run.attach = run.pts2.map((q) => { const loc = locate(q); return loc ? { face: loc.f, bary: loc.b } : { face: faces[0], bary: [1, 0, 0] as [number, number, number] }; });
     }
   }
 
