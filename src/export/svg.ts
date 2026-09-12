@@ -79,9 +79,15 @@ export function exportSvg(set: PatternSet, opts: SvgOptions = {}): string {
   }
 
   parts.push(`<g id="stitch-holes" fill="none" stroke="${c.stitch}" stroke-width="0.2">`);
-  for (const pc of set.pieces) for (const h of pc.holes) {
-    const P = layoutToSvg(set, toLayout(pc, h.p));
-    parts.push(`<circle cx="${fmt(P[0])}" cy="${fmt(P[1])}" r="${fmt(r)}"/>`);
+  for (const pc of set.pieces) {
+    const drawn = new Set<string>(); // shared corner holes appear once per piece
+    for (const h of pc.holes) {
+      const k = `${Math.round(h.p[0] * 10)},${Math.round(h.p[1] * 10)}`;
+      if (drawn.has(k)) continue;
+      drawn.add(k);
+      const P = layoutToSvg(set, toLayout(pc, h.p));
+      parts.push(`<circle cx="${fmt(P[0])}" cy="${fmt(P[1])}" r="${fmt(r)}"/>`);
+    }
   }
   parts.push('</g>');
 

@@ -448,7 +448,7 @@ export class Viewer {
     if (this.seamLines) this.seamLines.visible = this.visibility.seams;
     if (this.foldLines) this.foldLines.visible = this.visibility.folds;
     if (this.holes) this.holes.visible = this.visibility.holes;
-    if (this.threadLines) this.threadLines.visible = this.visibility.thread && this.explode < 0.3;
+    if (this.threadLines) this.threadLines.visible = this.visibility.thread && this.explode < 0.5;
     for (const l of this.labels) l.visible = this.visibility.labels;
     this.needsRender = true;
   }
@@ -560,13 +560,13 @@ export class Viewer {
       this.holes.instanceMatrix.needsUpdate = true;
       this.holes.computeBoundingSphere();
       if (this.threadLines) {
-        // links between matched holes: shown while assembled, fading out over the first 30% of the explode
+        // links between matched holes: shown while assembled, fading out over the first half of the explode
         const arr = (this.threadLines.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array;
         const pos = (i: number, k: number) => { const e = this.h0[3 * i + k] + (this.h1[3 * i + k] - this.h0[3 * i + k]) * a; return e + (this.h2[3 * i + k] - e) * b; };
         for (let q = 0; q < this.threadPairs.length; q++) for (let k = 0; k < 3; k++) arr[3 * q + k] = pos(this.threadPairs[q], k);
         (this.threadLines.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
         this.threadLines.geometry.computeBoundingSphere();
-        const fade = Math.max(0, 1 - t / 0.3);
+        const fade = Math.max(0, 1 - t / 0.5);
         (this.threadLines.material as THREE.LineBasicMaterial).opacity = fade;
         this.threadLines.visible = this.visibility.thread && fade > 0;
       }

@@ -60,7 +60,15 @@ function drawPattern(set: PatternSet, doc: jsPDF, tf: (p: V2) => V2, scale: numb
   // holes
   doc.setLineDashPattern([], 0); doc.setDrawColor(208, 52, 44); doc.setLineWidth(0.2 * scale);
   const r = (set.spec.holeDiameterMm / 2) * scale;
-  for (const pc of set.pieces) for (const h of pc.holes) d.circle(map(pc, h.p), r);
+  for (const pc of set.pieces) {
+    const drawn = new Set<string>();
+    for (const h of pc.holes) {
+      const k = `${Math.round(h.p[0] * 10)},${Math.round(h.p[1] * 10)}`;
+      if (drawn.has(k)) continue;
+      drawn.add(k);
+      d.circle(map(pc, h.p), r);
+    }
+  }
   // labels
   if (withLabels) {
     doc.setTextColor(40, 40, 40);
