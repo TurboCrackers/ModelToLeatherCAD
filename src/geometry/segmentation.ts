@@ -69,6 +69,8 @@ export interface SegmentationResult {
   edgeClass: Uint8Array;
   warnings: string[];
   splits: number;
+  /** original edges where a manual join asks the leather to fold in a way it cannot */
+  breakingEdges: number[];
 }
 
 export const defaultSegmentationParams = (positions: Float64Array): SegmentationParams => ({
@@ -768,15 +770,27 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
   // ---- 1. classify edges
   const hard = new Uint8Array(topo.ne);
   const isTightEdge = new Uint8Array(topo.ne);
+  let joinSharp = 0, joinTight = 0, joinTightMin = Infinity;
+  const breakingEdges: number[] = [];
   for (let e = 0; e < topo.ne; e++) {
     if (topo.edgeFaces[2 * e + 1] < 0) continue;
-    if (params.forbiddenSeamEdges.has(e)) continue;
-    if (params.forcedSeamEdges.has(e)) { hard[e] = 1; continue; }
     const th = topo.dihedral[e];
+    if (params.forbiddenSeamEdges.has(e)) {
+      // a manual join across an edge the leather cannot fold: the fabric would crack or wrinkle here
+      if (th >= creaseAngle && !params.canCreaseFold) { joinSharp++; breakingEdges.push(e); }
+      else if (th >= flatAngle && th < creaseAngle) {
+        const R = estimateBendRadius(th, (params.edgeStripWidth ?? topo.edgeStripWidth)[e]);
+        if (R < params.minBendRadiusMm) { joinTight++; joinTightMin = Math.min(joinTightMin, R); breakingEdges.push(e); }
+      }
+      continue;
+    }
+    if (params.forcedSeamEdges.has(e)) { hard[e] = 1; continue; }
     if (th < flatAngle) continue;
     if (th >= creaseAngle) { if (!params.canCreaseFold) hard[e] = 1; continue; }
     if (estimateBendRadius(th, (params.edgeStripWidth ?? topo.edgeStripWidth)[e]) < params.minBendRadiusMm) isTightEdge[e] = 1;
   }
+  if (joinSharp) warnings.push(`BREAKS: a manual join runs across ${joinSharp} sharp-corner edge(s) this leather is too thick to fold. It would crack there; keep that seam or choose thinner leather.`);
+  if (joinTight) warnings.push(`BREAKS: a manual join runs across ${joinTight} edge(s) bending to about ${joinTightMin.toFixed(1)} mm, tighter than this leather's ${params.minBendRadiusMm.toFixed(1)} mm minimum. It would wrinkle or crack there.`);
   // A fold is only possible along a straight crease: a crease that curves (a flat bottom
   // meeting a rounded wall) cannot be folded and must be sewn. Judge per connected crease chain.
   {
@@ -815,6 +829,9 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
       if (maxTurn > (8 * Math.PI) / 180 || totalTurn > (25 * Math.PI) / 180) for (const e of chain) curvedOrig.add(e);
     }
     if (curvedOrig.size) {
+      let joinedCurved = 0;
+      for (const e of curvedOrig) if (params.forbiddenSeamEdges.has(e)) { joinedCurved++; if (ot === topo) breakingEdges.push(e); }
+      if (joinedCurved) warnings.push(`BREAKS: a manual join runs along ${joinedCurved} edge(s) of a curved crease. Leather cannot fold along a curve; that edge has to be sewn.`);
       if (ot === topo) { for (const e of curvedOrig) if (!params.forbiddenSeamEdges.has(e)) hard[e] = 1; }
       else {
         // map original crease edges to refined sub-edges via lineage (both endpoints on that original edge)
@@ -1048,5 +1065,5 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
     if (seams.has(e)) { edgeClass[e] = EDGE_SEAM; continue; }
     edgeClass[e] = topo.dihedral[e] >= creaseAngle ? EDGE_FOLD : EDGE_SMOOTH;
   }
-  return { cut, faceToPatch, patches, edgeClass, warnings, splits };
+  return { cut, faceToPatch, patches, edgeClass, warnings, splits, breakingEdges };
 }

@@ -105,6 +105,10 @@ export interface Piece {
   overStrained: boolean;
   tightBend: boolean;
   maxStrain: number;
+  /** flattened outline crosses itself: the piece would overlap when cut flat */
+  selfOverlap: boolean;
+  /** flattening produced inverted triangles */
+  flipped: number;
   /** placement in the layout sheet */
   layout: { angle: number; tx: number; ty: number };
 }
@@ -222,7 +226,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     return {
       id: i, name: pieceName(i), patch, uv, loops, outlines, cutOutlines: [], runs: [], boundaryDisplay: new Map(), holes: [], foldLines: [], seamLabels: [], notches: [],
       areaMm2, centroid: outlines.length ? polygonCentroid(outlines[outerIdx]) : [0, 0], overStrained: patch.overStrained, tightBend: patch.tightBend,
-      maxStrain: patch.flat.maxStrain, layout: { angle: 0, tx: 0, ty: 0 },
+      maxStrain: patch.flat.maxStrain, selfOverlap: false, flipped: patch.flat.flippedFaces, layout: { angle: 0, tx: 0, ty: 0 },
     };
   });
 
@@ -438,7 +442,9 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     if (outerIdx >= 0 && newOutlines[outerIdx]) {
       pc.areaMm2 = Math.abs(signedArea(newOutlines[outerIdx])) - newOutlines.filter((_, j) => j !== outerIdx).reduce((a, o) => a + Math.abs(signedArea(o)), 0);
       pc.centroid = polygonCentroid(newOutlines[outerIdx]);
-      if (polygonSelfIntersects(newCut[outerIdx] ?? [])) warnings.push(`Piece ${pc.name}: cut outline self-intersects (check seam allowance vs. shape).`);
+      pc.selfOverlap = polygonSelfIntersects(newOutlines[outerIdx]);
+      if (pc.selfOverlap) warnings.push(`BREAKS: piece ${pc.name} overlaps itself when flattened; it cannot be cut from a flat hide. Add a cut through the overlapping region.`);
+      else if (polygonSelfIntersects(newCut[outerIdx] ?? [])) warnings.push(`Piece ${pc.name}: cut outline self-intersects (check seam allowance vs. shape).`);
     }
     // folds
     const seen = new Set<number>();

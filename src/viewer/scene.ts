@@ -75,6 +75,8 @@ export class Viewer {
   private threadPairs: number[] = []; // instance index pairs
   private threadLines: THREE.LineSegments | null = null;
   private selectedSeam: number | null = null;
+  private selectedPatchId: number | null = null;
+  private brokenPieces = new Set<number>();
   // per cut vertex, 3 states × 3 coords
   private s0!: Float32Array;
   private s1!: Float32Array;
@@ -501,15 +503,23 @@ export class Viewer {
     this.needsRender = true;
   }
 
+  /** Pieces the leather cannot physically make are tinted red. */
+  setBroken(ids: Set<number>): void {
+    this.brokenPieces = ids;
+    this.highlight(this.selectedPatchId, this.selectedSeam);
+  }
+
   highlight(patch: number | null, seam: number | null): void {
     this.selectedSeam = seam;
+    this.selectedPatchId = patch;
     if (!this.res || !this.mesh) return;
     const colors = this.mesh.geometry.getAttribute('color') as THREE.BufferAttribute;
     const ct = this.res.seg.cut.topo;
+    const red = new THREE.Color(0xff3b3b);
     for (let v = 0; v < ct.mesh.nv; v++) {
       const fs = csrRange(ct.vertexFaces, v);
       const p = fs.length ? this.res.seg.faceToPatch[fs[0]] : -1;
-      const c = patchColor(p);
+      const c = this.brokenPieces.has(p) ? red.clone() : patchColor(p);
       if (patch !== null && p === patch) c.offsetHSL(0, 0.2, 0.2);
       else if (patch !== null) c.offsetHSL(0, -0.3, -0.15);
       colors.setXYZ(v, c.r, c.g, c.b);

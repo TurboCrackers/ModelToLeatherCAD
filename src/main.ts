@@ -8,7 +8,7 @@ import { makeBox, makeCylinder, makeSphere, makePouch, makeTorus } from './geome
 import { shortestEdgePath } from './geometry/paths';
 import { simplifyIndices } from './pattern/smooth';
 import { V3 } from './geometry/vec';
-import { runPipeline, defaultPipelineSettings, PipelineResult, PipelineSettings, effectiveStretchLimit } from './pattern/pipeline';
+import { runPipeline, defaultPipelineSettings, PipelineResult, PipelineSettings, effectiveStretchLimit, MAX_FORMED_STRAIN } from './pattern/pipeline';
 import { seamKey } from './pattern/pattern';
 import { exportSvg } from './export/svg';
 import { exportPdf, PaperSize } from './export/pdf';
@@ -326,11 +326,35 @@ class App {
         this.setStatus(`${res.pattern.pieces.length} pieces, ${res.pattern.seams.length} seams, ${res.pattern.pieces.reduce((s, p) => s + p.holes.length, 0)} stitch holes · ${(res.pattern.totalAreaMm2 / 100).toFixed(0)} cm² of ${this.spec.family.name} · ${ms} ms`);
         const warnings = [...res.warnings];
         const limit = effectiveStretchLimit(this.spec, this.settings);
-        const over = res.pattern.pieces.filter((p) => p.overStrained);
+        // pieces the leather physically cannot make
+        const broken = new Map<number, string>();
+        for (const p of res.pattern.pieces) {
+          const reasons: string[] = [];
+          if (!Number.isFinite(p.maxStrain) || p.patch.flat.area2D === 0) reasons.push('is a closed surface and cannot be flattened');
+          if (p.flipped > 0) reasons.push('folds over itself when flattened');
+          if (p.selfOverlap) reasons.push('overlaps itself when flat');
+          if (p.maxStrain > MAX_FORMED_STRAIN) reasons.push(`would need ${(p.maxStrain * 100).toFixed(0)}% stretch, beyond even wet forming (${(MAX_FORMED_STRAIN * 100).toFixed(0)}%)`);
+          if (reasons.length) broken.set(p.id, reasons.join(', '));
+        }
+        for (const e of res.seg.breakingEdges) {
+          for (const f of [res.topo.edgeFaces[2 * e], res.topo.edgeFaces[2 * e + 1]]) {
+            if (f < 0) continue;
+            const pid = res.seg.faceToPatch[f];
+            if (!broken.has(pid)) broken.set(pid, 'contains a fold the leather cannot make (see below)');
+          }
+        }
+        const over = res.pattern.pieces.filter((p) => p.overStrained && !broken.has(p.id));
+        if (broken.size) warnings.unshift(`BREAKS: ${Array.from(broken).map(([id, why]) => `piece ${res.pattern.pieces[id].name} ${why}`).join('; ')}. Move or add a seam there.`);
         if (over.length) warnings.push(`Over the ${(limit * 100).toFixed(1)}% stretch limit: ${over.map((p) => `${p.name} (${(p.maxStrain * 100).toFixed(0)}%)`).join(', ')}${this.settings.manualMode ? ' — move a seam, add a cut, or raise the limit' : ''}.`);
-        if (this.settings.manualMode) warnings.unshift('Manual seam mode: your seams are kept as placed and automatic cutting is off. "Reset manual edits" returns to automatic.');
-        this.refs.warnings.textContent = warnings.join('  ·  ');
+        if (this.settings.manualMode) warnings.push('Manual seam mode: your seams are kept as placed and automatic cutting is off. "Reset manual edits" returns to automatic.');
+        const breaks = warnings.filter((w) => w.startsWith('BREAKS:'));
+        const rest = warnings.filter((w) => !w.startsWith('BREAKS:'));
+        this.refs.warnings.replaceChildren(
+          ...(breaks.length ? [el('span', { class: 'err' }, '⚠ These edits break the leather: ' + breaks.map((w) => w.slice(8)).join(' '))] : []),
+          rest.length ? el('span', {}, (breaks.length ? '  ·  ' : '') + rest.join('  ·  ')) : '',
+        );
         this.refs.warnings.title = warnings.join('\n');
+        this.viewer.setBroken(new Set(broken.keys()));
       } catch (err) {
         console.error(err);
         this.setStatus(`Error: ${(err as Error).message}`, true);
@@ -348,7 +372,7 @@ class App {
     this.refs.pieces.replaceChildren(...pieces.map((pc) => el('div', { class: 'item' + (this.selectedPatch === pc.id ? ' selected' : ''), onClick: () => this.select(pc.id, null) },
       el('span', { class: 'swatch', style: { background: '#' + patchColor(pc.id).getHexString() } }),
       el('span', { class: 'grow' }, `${pc.name} · ${(pc.areaMm2 / 100).toFixed(1)} cm² · ${pc.holes.length} holes`),
-      el('span', { class: pc.overStrained ? 'warn' : '' }, `${(pc.maxStrain * 100).toFixed(1)}%${pc.overStrained ? ' ⚠' : ''}${pc.tightBend ? ' ↻' : ''}`),
+      el('span', { class: pc.selfOverlap || pc.flipped > 0 || pc.maxStrain > MAX_FORMED_STRAIN ? 'err' : pc.overStrained ? 'warn' : '' }, `${(pc.maxStrain * 100).toFixed(1)}%${pc.selfOverlap || pc.flipped > 0 || pc.maxStrain > MAX_FORMED_STRAIN ? ' ✖ breaks' : pc.overStrained ? ' ⚠' : ''}${pc.tightBend ? ' ↻' : ''}`),
     )));
     this.refs.seams.replaceChildren(...seams.map((s) => {
       const sel = el('select', { onChange: (e: Event) => { e.stopPropagation(); this.setSeamType(s.id, sel.value as SeamType); }, onClick: (e: Event) => e.stopPropagation() }, option('turned', 'turned', s.type === 'turned'), option('butted', 'butted', s.type === 'butted'));

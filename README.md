@@ -28,6 +28,8 @@ Open the URL Vite prints (default http://localhost:5173). `npm run build` produc
    - **Join** – click a seam to remove it.
    - **Seam type** – click a seam to toggle turned ↔ butted.
 
+   Edits that ask the leather to do something it physically cannot are flagged in red as **breaks the leather**, and the affected pieces are tinted red in the 3D view: a piece that would need more stretch than even wet forming allows, a piece that folds over or overlaps itself when flattened, a piece that has become a closed surface, or a Join across an edge the leather cannot fold (a bend tighter than its minimum radius, a sharp corner in leather too thick to crease, or a curved crease).
+
    Any manual edit switches to *manual seam mode*: every existing seam is pinned so only what you touched changes, and automatic cutting is turned off. Pieces that then exceed the leather's stretch limit are flagged in the status bar and piece list (with their strain) rather than cut up, so you can move a seam, add a cut, or raise the limit. *Reset manual edits* returns to the automatic layout.
 6. **Export** – SVG (1:1, mm, layered groups for cut / stitch holes / folds / labels) and PDF. The PDF (A4 by default, other sizes available) contains a specification page with an overview, 1:1 tiles with overlap guides, crop marks and a scale bar to tape together, and making instructions: leather specification, tools and thread, cutting and marking, forming notes, and a step-by-step assembly order for every seam and dart.
 
