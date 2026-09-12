@@ -1,0 +1,25 @@
+{
+  "name": "model-to-leather-cad",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Convert 3D models into leather patterns with physically-informed cuts, matched stitch holes, SVG/PDF export and a 3D explode/assemble editor.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jspdf": "^2.5.2",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "@types/three": "^0.169.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "vitest": "^2.1.4"
+  }
+}

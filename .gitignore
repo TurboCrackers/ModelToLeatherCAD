@@ -30,3 +30,10 @@
 *.exe
 *.out
 *.app
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+*.log
+public/_*
