@@ -28,6 +28,8 @@ export interface PipelineSettings {
   goreAxis: 'auto' | 'x' | 'y' | 'z';
   forcedSeamEdges: Set<number>;
   forbiddenSeamEdges: Set<number>;
+  /** after a manual seam edit: keep the user's layout, flag over-strained pieces instead of cutting them */
+  manualMode: boolean;
   layout: LayoutOptions;
 }
 
@@ -46,6 +48,7 @@ export const defaultPipelineSettings = (): PipelineSettings => ({
   goreAxis: 'auto',
   forcedSeamEdges: new Set(),
   forbiddenSeamEdges: new Set(),
+  manualMode: false,
   layout: { gapMm: 8, sheetWidthMm: 0, marginMm: 10 },
 });
 
@@ -90,7 +93,7 @@ export function runPipeline(model: TriMesh, spec: LeatherSpec, s: PipelineSettin
     mergePieces: true,
     regularSeams: s.regularSeams,
     goreAxis: s.goreAxis,
-    maxSplits: s.maxSplits,
+    maxSplits: s.manualMode ? 0 : s.maxSplits,
     forcedSeamEdges: s.forcedSeamEdges,
     forbiddenSeamEdges: s.forbiddenSeamEdges,
     edgeStripWidth,

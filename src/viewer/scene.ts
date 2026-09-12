@@ -67,6 +67,10 @@ export class Viewer {
   private origToCut: Map<number, number> = new Map();
   private modelSize = 100;
   onPick: ((p: PickInfo) => void) | null = null;
+  /** return true to capture the drag (orbit is suspended until pointer up) */
+  onDragStart: ((p: PickInfo) => boolean) | null = null;
+  onDragMove: ((p: PickInfo | null) => void) | null = null;
+  onDragEnd: ((p: PickInfo | null) => void) | null = null;
   private needsRender = true;
 
   constructor(private container: HTMLElement) {
@@ -110,43 +114,73 @@ export class Viewer {
     this.needsRender = true;
   }
 
+  /** Raycast the pointer onto the mesh in its current (possibly exploded) state. */
+  pickAt(clientX: number, clientY: number): PickInfo | null {
+    if (!this.mesh || !this.res) return null;
+    const el = this.renderer.domElement;
+    const rect = el.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const hits = ray.intersectObject(this.mesh, false);
+    if (!hits.length || hits[0].faceIndex === undefined || hits[0].faceIndex === null) return null;
+    const face = hits[0].faceIndex as number;
+    const pt = hits[0].point;
+    const ct = this.res.seg.cut.topo;
+    let bestV = -1, bd = Infinity;
+    for (let k = 0; k < 3; k++) {
+      const cv = ct.mesh.indices[3 * face + k];
+      const d = Math.hypot(this.cur[3 * cv] - pt.x, this.cur[3 * cv + 1] - pt.y, this.cur[3 * cv + 2] - pt.z);
+      if (d < bd) { bd = d; bestV = cv; }
+    }
+    let nearest: PickInfo['nearestSeam'] = null;
+    const P = new THREE.Vector3().copy(pt), A = new THREE.Vector3(), B = new THREE.Vector3(), C = new THREE.Vector3();
+    for (let i = 0; i < this.seamEdgeIds.length; i++) {
+      if (this.seamEdgeIds[i] < 0) continue;
+      A.set(this.lineCur[6 * i], this.lineCur[6 * i + 1], this.lineCur[6 * i + 2]);
+      B.set(this.lineCur[6 * i + 3], this.lineCur[6 * i + 4], this.lineCur[6 * i + 5]);
+      new THREE.Line3(A, B).closestPointToPoint(P, true, C);
+      const d = C.distanceTo(P);
+      if (!nearest || d < nearest.dist) nearest = { id: this.seamEdgeIds[i], dist: d };
+    }
+    return { face, patchId: this.res.seg.faceToPatch[face], vertex: this.res.seg.cut.origVertex[bestV], point: [pt.x, pt.y, pt.z], nearestSeam: nearest };
+  }
+
   private setupPicking(): void {
     const el = this.renderer.domElement;
     let down: [number, number] | null = null;
-    el.addEventListener('pointerdown', (e) => (down = [e.clientX, e.clientY]));
+    let dragging = false;
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      down = [e.clientX, e.clientY];
+      if (this.onDragStart) {
+        const p = this.pickAt(e.clientX, e.clientY);
+        if (p && this.onDragStart(p)) {
+          dragging = true;
+          this.controls.enabled = false;
+          el.setPointerCapture(e.pointerId);
+        }
+      }
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!dragging || !this.onDragMove) return;
+      this.onDragMove(this.pickAt(e.clientX, e.clientY));
+    });
     el.addEventListener('pointerup', (e) => {
+      if (dragging) {
+        dragging = false;
+        this.controls.enabled = true;
+        try { el.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+        this.onDragEnd?.(this.pickAt(e.clientX, e.clientY));
+        down = null;
+        return;
+      }
       if (!down) return;
       const moved = Math.hypot(e.clientX - down[0], e.clientY - down[1]);
       down = null;
-      if (moved > 4 || !this.mesh || !this.res || !this.onPick) return;
-      const rect = el.getBoundingClientRect();
-      const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
-      const ray = new THREE.Raycaster();
-      ray.setFromCamera(ndc, this.camera);
-      const hits = ray.intersectObject(this.mesh, false);
-      if (!hits.length || hits[0].faceIndex === undefined || hits[0].faceIndex === null) return;
-      const face = hits[0].faceIndex as number;
-      const pt = hits[0].point;
-      const ct = this.res.seg.cut.topo;
-      let bestV = -1, bd = Infinity;
-      for (let k = 0; k < 3; k++) {
-        const cv = ct.mesh.indices[3 * face + k];
-        const d = Math.hypot(this.cur[3 * cv] - pt.x, this.cur[3 * cv + 1] - pt.y, this.cur[3 * cv + 2] - pt.z);
-        if (d < bd) { bd = d; bestV = cv; }
-      }
-      // nearest seam edge in the current state
-      let nearest: PickInfo['nearestSeam'] = null;
-      const P = new THREE.Vector3(), A = new THREE.Vector3(), B = new THREE.Vector3(), C = new THREE.Vector3();
-      P.copy(pt);
-      for (let i = 0; i < this.seamEdgeIds.length; i++) {
-        if (this.seamEdgeIds[i] < 0) continue;
-        A.set(this.lineCur[6 * i], this.lineCur[6 * i + 1], this.lineCur[6 * i + 2]);
-        B.set(this.lineCur[6 * i + 3], this.lineCur[6 * i + 4], this.lineCur[6 * i + 5]);
-        new THREE.Line3(A, B).closestPointToPoint(P, true, C);
-        const d = C.distanceTo(P);
-        if (!nearest || d < nearest.dist) nearest = { id: this.seamEdgeIds[i], dist: d };
-      }
-      this.onPick({ face, patchId: this.res.seg.faceToPatch[face], vertex: this.res.seg.cut.origVertex[bestV], point: [pt.x, pt.y, pt.z], nearestSeam: nearest });
+      if (moved > 4 || !this.onPick) return;
+      const p = this.pickAt(e.clientX, e.clientY);
+      if (p) this.onPick(p);
     });
   }
 

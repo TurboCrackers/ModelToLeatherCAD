@@ -21,9 +21,12 @@ Open the URL Vite prints (default http://localhost:5173). `npm run build` produc
 4. **Pattern** – the pattern recomputes automatically. The 3D view shows pieces in colour, seams (yellow = turned, orange = butted), fold lines (blue) and stitch holes (red). Drag the slider from *Assembled* through *Exploded* to *Flat pattern*.
 5. **Edit** – tools in the 3D view:
    - **Select** – click a piece or seam for details; the seam list lets you change each seam's construction.
-   - **Cut** – click two points; a seam is added along the shortest path across the surface.
-   - **Join** – click a seam to remove it. If the merged piece cannot be flattened within the leather's stretch limit it is automatically cut again elsewhere.
+   - **Cut** – press on the model, drag, release (or click two points); a seam is added along the shortest path across the surface, with a live preview.
+   - **Move** – press on a seam and drag; the seam re-routes through the pointer while keeping both ends, release to apply.
+   - **Join** – click a seam to remove it.
    - **Seam type** – click a seam to toggle turned ↔ butted.
+
+   Any manual edit switches to *manual seam mode*: every existing seam is pinned so only what you touched changes, and automatic cutting is turned off. Pieces that then exceed the leather's stretch limit are flagged in the status bar and piece list (with their strain) rather than cut up, so you can move a seam, add a cut, or raise the limit. *Reset manual edits* returns to the automatic layout.
 6. **Export** – SVG (1:1, mm, layered groups for cut / stitch holes / folds / labels) and PDF. The PDF (A4 by default, other sizes available) contains a specification page with an overview, 1:1 tiles with overlap guides, crop marks and a scale bar to tape together, and making instructions: leather specification, tools and thread, cutting and marking, forming notes, and a step-by-step assembly order for every seam and dart.
 
 ## How the leather drives the cuts

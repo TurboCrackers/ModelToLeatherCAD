@@ -12,7 +12,7 @@ import { exportSvg } from './export/svg';
 import { exportPdf, PaperSize } from './export/pdf';
 import { Viewer, PickInfo, patchColor } from './viewer/scene';
 
-type Tool = 'select' | 'cut' | 'join' | 'seamtype';
+type Tool = 'select' | 'cut' | 'move' | 'join' | 'seamtype';
 const UNIT_SCALE: Record<string, number> = { mm: 1, cm: 10, m: 1000, in: 25.4 };
 
 class App {
@@ -43,6 +43,9 @@ class App {
     root.append(this.buildHeader(), this.buildLeft(), this.buildCenter(), this.buildRight(), this.buildStatus());
     this.viewer = new Viewer(this.refs.viewport);
     this.viewer.onPick = (p) => this.onPick(p);
+    this.viewer.onDragStart = (p) => this.onDragStart(p);
+    this.viewer.onDragMove = (p) => this.onDragMove(p);
+    this.viewer.onDragEnd = (p) => this.onDragEnd(p);
     this.refreshLeatherUI();
     this.setStatus('Load a model (STL, OBJ, PLY, glTF) or pick a sample shape to begin.');
   }
@@ -101,7 +104,7 @@ class App {
     const goreAxis = el('select', { onChange: () => { this.settings.goreAxis = goreAxis.value as any; this.scheduleRecompute('full'); } }, option('auto', 'Auto (flattest direction / Y)'), option('x', 'X axis'), option('y', 'Y axis'), option('z', 'Z axis'));
     const auto = el('input', { type: 'checkbox', checked: true, onChange: () => (this.autoUpdate = auto.checked) });
     const recompute = el('button', { class: 'primary', onClick: () => this.recompute('full') }, 'Recompute pattern');
-    const reset = el('button', { onClick: () => { this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.recompute('full'); } }, 'Reset manual edits');
+    const reset = el('button', { onClick: () => { this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.settings.manualMode = false; this.recompute('full'); } }, 'Reset manual edits');
 
     // lists
     this.refs.pieces = el('div', { class: 'list' });
@@ -172,7 +175,7 @@ class App {
     const drop = el('div', { class: 'dropzone' }, 'Drop a 3D model file');
     const center = el('main', { class: 'center' }, viewport, empty,
       el('div', { class: 'overlay-top' },
-        el('div', { class: 'tools' }, toolBtn('select', 'Select', 'Click a piece or seam to inspect it'), toolBtn('cut', 'Cut', 'Click two points on the model to add a seam along the shortest path'), toolBtn('join', 'Join', 'Click a seam to remove it (pieces merge if the leather allows)'), toolBtn('seamtype', 'Seam type', 'Click a seam to toggle turned / butted')),
+        el('div', { class: 'tools' }, toolBtn('select', 'Select', 'Click a piece or seam to inspect it'), toolBtn('cut', 'Cut', 'Drag across the model (or click two points) to add a seam along the shortest path'), toolBtn('move', 'Move', 'Drag a seam to re-route it through the pointer; its ends stay put'), toolBtn('join', 'Join', 'Click a seam to remove it (pieces merge if the leather allows)'), toolBtn('seamtype', 'Seam type', 'Click a seam to toggle turned / butted')),
         tip),
       el('div', { class: 'overlay-bottom' },
         el('div', { class: 'col' }, slider, el('div', { class: 'stages' }, el('span', {}, 'Assembled'), el('span', {}, 'Exploded'), el('span', {}, 'Flat pattern'))),
@@ -214,7 +217,7 @@ class App {
     this.rawModel = mesh;
     this.modelName = name;
     if (resetUnits) { this.unitScale = 1; (this.refs.units as HTMLSelectElement).value = 'mm'; }
-    this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear();
+    this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.settings.manualMode = false;
     this.cutStart = null;
     this.refs.empty.style.display = 'none';
     const bb = boundingBox(mesh);
@@ -298,8 +301,13 @@ class App {
         this.refreshPreview();
         const ms = Math.round(performance.now() - t0);
         this.setStatus(`${res.pattern.pieces.length} pieces, ${res.pattern.seams.length} seams, ${res.pattern.pieces.reduce((s, p) => s + p.holes.length, 0)} stitch holes · ${(res.pattern.totalAreaMm2 / 100).toFixed(0)} cm² of ${this.spec.family.name} · ${ms} ms`);
-        this.refs.warnings.textContent = res.warnings.join('  ·  ');
-        this.refs.warnings.title = res.warnings.join('\n');
+        const warnings = [...res.warnings];
+        const limit = effectiveStretchLimit(this.spec, this.settings);
+        const over = res.pattern.pieces.filter((p) => p.overStrained);
+        if (over.length) warnings.push(`Over the ${(limit * 100).toFixed(1)}% stretch limit: ${over.map((p) => `${p.name} (${(p.maxStrain * 100).toFixed(0)}%)`).join(', ')}${this.settings.manualMode ? ' — move a seam, add a cut, or raise the limit' : ''}.`);
+        if (this.settings.manualMode) warnings.unshift('Manual seam mode: your seams are kept as placed and automatic cutting is off. "Reset manual edits" returns to automatic.');
+        this.refs.warnings.textContent = warnings.join('  ·  ');
+        this.refs.warnings.title = warnings.join('\n');
       } catch (err) {
         console.error(err);
         this.setStatus(`Error: ${(err as Error).message}`, true);
@@ -363,11 +371,12 @@ class App {
     this.tool = t;
     this.cutStart = null;
     this.viewer?.showPath([], []);
-    for (const k of ['select', 'cut', 'join', 'seamtype'] as Tool[]) this.refs['tool_' + k].classList.toggle('active', k === t);
+    for (const k of ['select', 'cut', 'move', 'join', 'seamtype'] as Tool[]) this.refs['tool_' + k].classList.toggle('active', k === t);
     const tips: Record<Tool, string> = {
       select: 'Select: click a piece or a seam to inspect it. Drag to orbit, wheel to zoom, right-drag to pan.',
-      cut: 'Cut: click a start point, then an end point on the model. A seam is added along the shortest mesh path and the pattern recomputes.',
-      join: 'Join: click near a seam to remove it. If the merged piece would exceed the leather stretch limit, it is cut again elsewhere.',
+      cut: 'Cut: press on the model, drag, release (or click two points). A seam follows the shortest surface path; other seams stay where they are.',
+      move: 'Move: press on a seam and drag. The seam re-routes through the pointer, keeping its two ends; release to apply. Right-drag orbits.',
+      join: 'Join: click near a seam to remove it. If the merged piece exceeds the leather stretch limit it is flagged so you can place a better seam.',
       seamtype: 'Seam type: click near a seam to toggle it between turned (allowance added) and butted (holes inset from the cut edge).',
     };
     this.refs.tip.textContent = tips[t];
@@ -376,7 +385,7 @@ class App {
   private onPick(p: PickInfo): void {
     if (!this.result) return;
     const size = boundingBox(this.result.topo.mesh).maxDim;
-    const nearSeam = p.nearestSeam && p.nearestSeam.dist < size * 0.03 ? p.nearestSeam.id : null;
+    const nearSeam = p.nearestSeam && p.nearestSeam.dist < size * 0.05 ? p.nearestSeam.id : null;
     switch (this.tool) {
       case 'select':
         this.select(nearSeam === null ? p.patchId : null, nearSeam);
@@ -389,6 +398,7 @@ class App {
         } else {
           const path = shortestEdgePath(this.result.topo, this.cutStart, p.vertex);
           if (!path.length) { this.setStatus('Cut: no path between those points.', true); this.cutStart = null; this.viewer.showPath([], []); return; }
+          this.freezeSeams();
           for (const e of path) { this.settings.forcedSeamEdges.add(e); this.settings.forbiddenSeamEdges.delete(e); }
           this.cutStart = null;
           this.viewer.showPath([], []);
@@ -399,6 +409,7 @@ class App {
       case 'join': {
         if (nearSeam === null) { this.setStatus('Join: click closer to a seam line.'); return; }
         const s = this.result.pattern.seams[nearSeam];
+        this.freezeSeams(s.id);
         for (const e of s.origEdges) { this.settings.forbiddenSeamEdges.add(e); this.settings.forcedSeamEdges.delete(e); }
         this.recompute('full');
         break;
@@ -409,6 +420,96 @@ class App {
         this.setSeamType(s.id, s.type === 'turned' ? 'butted' : 'turned');
         break;
       }
+    }
+  }
+
+  // ───────────────────────── drag editing
+  private drag: { kind: 'cut'; start: number } | { kind: 'move'; seamId: number; a: number; b: number; oldEdges: number[] } | null = null;
+  private dragPath: number[] = [];
+
+  /** Pin every current seam so an edit changes only what the user touched. */
+  private freezeSeams(exceptSeam: number | null = null): void {
+    if (!this.result) return;
+    this.settings.manualMode = true;
+    for (const s of this.result.pattern.seams) {
+      if (s.id === exceptSeam) continue;
+      for (const e of s.origEdges) if (!this.settings.forbiddenSeamEdges.has(e)) this.settings.forcedSeamEdges.add(e);
+    }
+  }
+
+  /** Ordered original vertices along an ordered edge list. */
+  private pathVertices(edges: number[]): number[] {
+    if (!this.result || !edges.length) return [];
+    const ev = this.result.topo.edgeVerts;
+    if (edges.length === 1) return [ev[2 * edges[0]], ev[2 * edges[0] + 1]];
+    const shared = (e1: number, e2: number) => (ev[2 * e1] === ev[2 * e2] || ev[2 * e1] === ev[2 * e2 + 1] ? ev[2 * e1] : ev[2 * e1 + 1]);
+    const first = shared(edges[0], edges[1]);
+    const verts = [ev[2 * edges[0]] === first ? ev[2 * edges[0] + 1] : ev[2 * edges[0]], first];
+    for (let i = 1; i < edges.length; i++) { const e = edges[i]; const prev = verts[verts.length - 1]; verts.push(ev[2 * e] === prev ? ev[2 * e + 1] : ev[2 * e]); }
+    return verts;
+  }
+
+  private onDragStart(p: PickInfo): boolean {
+    if (!this.result) return false;
+    if (this.tool === 'cut') {
+      this.drag = { kind: 'cut', start: p.vertex };
+      this.dragPath = [];
+      this.viewer.showPath([], [p.vertex]);
+      return true;
+    }
+    if (this.tool === 'move') {
+      const size = boundingBox(this.result.topo.mesh).maxDim;
+      if (!p.nearestSeam || p.nearestSeam.dist > size * 0.05) return false;
+      const seam = this.result.pattern.seams[p.nearestSeam.id];
+      const verts = this.pathVertices(seam.origEdges);
+      if (verts.length < 2) return false;
+      this.drag = { kind: 'move', seamId: seam.id, a: verts[0], b: verts[verts.length - 1], oldEdges: seam.origEdges.slice() };
+      this.select(null, seam.id);
+      this.setStatus(`Moving seam ${seam.label}: drag to re-route it, release to apply.`);
+      return true;
+    }
+    return false;
+  }
+
+  private onDragMove(p: PickInfo | null): void {
+    if (!this.drag || !this.result || !p) return;
+    if (this.drag.kind === 'cut') {
+      this.dragPath = shortestEdgePath(this.result.topo, this.drag.start, p.vertex);
+      this.viewer.showPath(this.pathVertices(this.dragPath), [this.drag.start, p.vertex]);
+    } else {
+      const { a, b } = this.drag;
+      const p1 = shortestEdgePath(this.result.topo, a, p.vertex);
+      const p2 = shortestEdgePath(this.result.topo, p.vertex, b);
+      this.dragPath = [...p1, ...p2];
+      this.viewer.showPath([...this.pathVertices(p1), ...this.pathVertices(p2).slice(1)], [a, p.vertex, b]);
+    }
+  }
+
+  private onDragEnd(p: PickInfo | null): void {
+    const d = this.drag;
+    this.drag = null;
+    this.viewer.showPath([], []);
+    if (!d || !this.result) return;
+    if (d.kind === 'cut') {
+      if (!p || p.vertex === d.start) {
+        // treated as a click: fall back to the two-click flow
+        this.cutStart = d.start;
+        this.viewer.showPath([], [d.start]);
+        this.setStatus('Cut: now click (or drag to) the end point.');
+        return;
+      }
+      const path = this.dragPath.length ? this.dragPath : shortestEdgePath(this.result.topo, d.start, p.vertex);
+      if (!path.length) { this.setStatus('Cut: no path between those points.', true); return; }
+      this.freezeSeams();
+      for (const e of path) { this.settings.forcedSeamEdges.add(e); this.settings.forbiddenSeamEdges.delete(e); }
+      this.cutStart = null;
+      this.recompute('full');
+    } else {
+      if (!p || !this.dragPath.length) { this.setStatus('Move cancelled.'); return; }
+      this.freezeSeams(d.seamId);
+      for (const e of d.oldEdges) { this.settings.forcedSeamEdges.delete(e); this.settings.forbiddenSeamEdges.add(e); }
+      for (const e of this.dragPath) { this.settings.forbiddenSeamEdges.delete(e); this.settings.forcedSeamEdges.add(e); }
+      this.recompute('full');
     }
   }
 
