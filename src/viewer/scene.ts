@@ -190,7 +190,7 @@ export class Viewer {
     this.needsRender = true;
   }
 
-  setResult(res: PipelineResult | null): void {
+  setResult(res: PipelineResult | null, fitCamera = true): void {
     this.clear();
     this.res = res;
     if (!res) return;
@@ -335,7 +335,8 @@ export class Viewer {
     this.highlightLine = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 }));
     this.root.add(this.highlightLine);
     this.updatePositions();
-    this.fitCamera(min as V3, max as V3, floorY);
+    if (fitCamera) this.fitCamera(min as V3, max as V3, floorY);
+    else this.needsRender = true;
   }
 
   private fitCamera(min: V3, max: V3, floorY: number): void {

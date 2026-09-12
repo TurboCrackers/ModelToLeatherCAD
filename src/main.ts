@@ -34,6 +34,8 @@ class App {
   refs: Record<string, HTMLElement> = {};
   private computing = false;
   private pendingRecompute = false;
+  /** frame the camera on the next result (only after loading a model, never on edits) */
+  private fitCameraNext = true;
 
   get spec(): LeatherSpec { return buildLeatherSpec(getFamily(this.familyId), this.thicknessMm, this.overrides); }
   get family(): LeatherFamily { return getFamily(this.familyId); }
@@ -64,12 +66,12 @@ class App {
       el('button', { onClick: () => this.setModel(makePouch(140, 90, 45, 14), 'pouch') }, 'Pouch'),
       el('button', { onClick: () => this.setModel(makeTorus(60, 22, 20, 40), 'torus') }, 'Torus'),
     );
-    const units = el('select', { onChange: () => { this.unitScale = UNIT_SCALE[units.value]; this.refreshModelStats(); this.scheduleRecompute('full'); } }, ...['mm', 'cm', 'm', 'in'].map((u) => option(u, u, u === 'mm')));
+    const units = el('select', { onChange: () => { this.unitScale = UNIT_SCALE[units.value]; this.fitCameraNext = true; this.refreshModelStats(); this.scheduleRecompute('full'); } }, ...['mm', 'cm', 'm', 'in'].map((u) => option(u, u, u === 'mm')));
     const longest = el('input', { type: 'number', step: 'any', min: 1, onChange: () => {
       if (!this.rawModel) return;
       const raw = boundingBox(this.rawModel).maxDim;
       const v = parseFloat(longest.value);
-      if (v > 0 && raw > 0) { this.unitScale = v / raw; this.scheduleRecompute('full'); this.refreshModelStats(); }
+      if (v > 0 && raw > 0) { this.unitScale = v / raw; this.fitCameraNext = true; this.scheduleRecompute('full'); this.refreshModelStats(); }
     } });
     this.refs.units = units; this.refs.longest = longest;
     this.refs.modelStats = el('div', { class: 'desc' }, 'No model loaded.');
@@ -220,6 +222,7 @@ class App {
     this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.settings.manualMode = false;
     this.cutStart = null;
     this.refs.empty.style.display = 'none';
+    this.fitCameraNext = true;
     const bb = boundingBox(mesh);
     if (bb.maxDim * this.unitScale < 20) this.setStatus(`Model is only ${(bb.maxDim * this.unitScale).toFixed(2)} mm across in the assumed units; set the longest dimension if that is wrong.`);
     this.refreshModelStats();
@@ -295,7 +298,8 @@ class App {
         const t0 = performance.now();
         const res = runPipeline(model, this.spec, this.settings, (m) => this.setStatus(m));
         this.result = res;
-        this.viewer.setResult(res);
+        this.viewer.setResult(res, this.fitCameraNext);
+        this.fitCameraNext = false;
         this.viewer.setExplode(parseFloat((this.refs.slider as HTMLInputElement).value));
         this.refreshLists();
         this.refreshPreview();
