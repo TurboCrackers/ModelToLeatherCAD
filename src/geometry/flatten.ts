@@ -1,5 +1,5 @@
 import { MeshTopology } from './mesh';
-import { SparseBuilder, pcgSolve } from './sparse';
+import { SparseBuilder, solveSPD } from './sparse';
 import { V3, sub3, dot3, cross3, len3 } from './vec';
 
 export interface FlattenResult {
@@ -79,24 +79,37 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
     return { vertices: Int32Array.from(verts), localIndex, localFaces, faces, uv, faceStrain, maxStrain: 0, meanStrain: 0, flippedFaces: 0, area3D, area2D: 0 };
   }
 
-  // ---- pins: two mutually far vertices
-  const P = (i: number): V3 => {
-    const v = verts[i];
-    return [positions[3 * v], positions[3 * v + 1], positions[3 * v + 2]];
-  };
-  const farthest = (from: number): number => {
-    let best = 0, bd = -1;
-    const a = P(from);
-    for (let i = 0; i < nv; i++) {
-      const d = len3(sub3(P(i), a));
-      if (d > bd) { bd = d; best = i; }
+  // ---- pins: two geodesically far vertices, pinned at their geodesic distance
+  // (Euclidean distance would fold a strip that wraps around the object)
+  const adj: number[][] = Array.from({ length: nv }, () => []);
+  const adjW: number[][] = Array.from({ length: nv }, () => []);
+  for (let t = 0; t < nf; t++) {
+    for (let k = 0; k < 3; k++) {
+      const i = localFaces[3 * t + k], j = localFaces[3 * t + ((k + 1) % 3)];
+      const vi = verts[i], vj = verts[j];
+      const w = Math.hypot(positions[3 * vi] - positions[3 * vj], positions[3 * vi + 1] - positions[3 * vj + 1], positions[3 * vi + 2] - positions[3 * vj + 2]);
+      adj[i].push(j); adjW[i].push(w); adj[j].push(i); adjW[j].push(w);
     }
-    return best;
+  }
+  const geodesic = (src: number): Float64Array => {
+    const dist = new Float64Array(nv).fill(Infinity);
+    dist[src] = 0;
+    const heap: Array<[number, number]> = [[0, src]];
+    const push = (x: [number, number]) => { heap.push(x); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+    const pop = (): [number, number] => { const top = heap[0]; const last = heap.pop()!; if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
+    while (heap.length) {
+      const [d, v] = pop();
+      if (d > dist[v]) continue;
+      for (let k = 0; k < adj[v].length; k++) { const w = adj[v][k], nd = d + adjW[v][k]; if (nd < dist[w]) { dist[w] = nd; push([nd, w]); } }
+    }
+    return dist;
   };
-  let pinB = farthest(0);
-  const pinA = farthest(pinB);
+  const argmax = (d: Float64Array): number => { let b = 0; for (let i = 1; i < nv; i++) if (d[i] > d[b] && isFinite(d[i])) b = i; return b; };
+  let pinB = argmax(geodesic(0));
+  const dA = geodesic(pinB);
+  const pinA = argmax(dA);
   if (pinA === pinB) pinB = (pinA + 1) % nv;
-  const pinDist = len3(sub3(P(pinA), P(pinB)));
+  const pinDist = isFinite(dA[pinA]) && dA[pinA] > 0 ? dA[pinA] : Math.hypot(positions[3 * verts[pinA]] - positions[3 * verts[pinB]], positions[3 * verts[pinA] + 1] - positions[3 * verts[pinB] + 1], positions[3 * verts[pinA] + 2] - positions[3 * verts[pinB] + 2]);
 
   // ---- LSCM
   const freeIndex = new Int32Array(nv).fill(-1);
@@ -144,7 +157,7 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
     }
   }
   const x = new Float64Array(2 * nFree);
-  if (nFree > 0) pcgSolve(N.build(), rhs, x, 3e-5, 1200);
+  if (nFree > 0) solveSPD(N.build(), rhs, x);
   for (let i = 0; i < nv; i++) {
     const fi = freeIndex[i];
     if (fi >= 0) { uv[2 * i] = x[2 * fi]; uv[2 * i + 1] = x[2 * fi + 1]; }
@@ -177,6 +190,7 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
   const anchorW = 1;
   Lb.add(anchor, anchor, anchorW);
   const L = Lb.build();
+  const lCache: { chol?: import('./sparse').BandedCholesky | null } = {};
   const bu = new Float64Array(nv), bv = new Float64Array(nv);
   const U = new Float64Array(nv), Vv = new Float64Array(nv);
   for (let i = 0; i < nv; i++) { U[i] = uv[2 * i]; Vv[i] = uv[2 * i + 1]; }
@@ -215,8 +229,8 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
     }
     bu[anchor] += anchorW * U[anchor];
     bv[anchor] += anchorW * Vv[anchor];
-    pcgSolve(L, bu, U, 1e-5, 800);
-    pcgSolve(L, bv, Vv, 1e-5, 800);
+    solveSPD(L, bu, U, lCache);
+    solveSPD(L, bv, Vv, lCache);
   }
   for (let i = 0; i < nv; i++) { uv[2 * i] = U[i]; uv[2 * i + 1] = Vv[i]; }
 

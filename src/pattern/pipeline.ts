@@ -1,5 +1,5 @@
 import { TriMesh, buildTopology, orientMesh, offsetMesh, MeshTopology } from '../geometry/mesh';
-import { refineToTarget } from '../geometry/subdivide';
+import { refineToTarget, inheritedStripWidth } from '../geometry/subdivide';
 import { segmentMesh, SegmentationResult, defaultSegmentationParams } from '../geometry/segmentation';
 import { buildPattern, PatternSet, PatternOptions } from './pattern';
 import { layoutPieces, LayoutOptions } from './layout';
@@ -23,6 +23,9 @@ export interface PipelineSettings {
   smoothCutLines: boolean;
   /** subdivide the imported mesh until it has at least this many triangles (0 = never) */
   refineTargetFaces: number;
+  /** regular gore seams for smoothly curved regions */
+  regularSeams: boolean;
+  goreAxis: 'auto' | 'x' | 'y' | 'z';
   forcedSeamEdges: Set<number>;
   forbiddenSeamEdges: Set<number>;
   layout: LayoutOptions;
@@ -39,6 +42,8 @@ export const defaultPipelineSettings = (): PipelineSettings => ({
   rawEdgeAllowanceMm: 0,
   smoothCutLines: true,
   refineTargetFaces: 3000,
+  regularSeams: true,
+  goreAxis: 'auto',
   forcedSeamEdges: new Set(),
   forbiddenSeamEdges: new Set(),
   layout: { gapMm: 8, sheetWidthMm: 0, marginMm: 10 },
@@ -62,14 +67,19 @@ export function effectiveStretchLimit(spec: LeatherSpec, s: PipelineSettings): n
 
 /** Model (mm) → developed neutral surface → segmentation → pattern → layout. */
 export function runPipeline(model: TriMesh, spec: LeatherSpec, s: PipelineSettings, onProgress?: (m: string) => void): PipelineResult {
-  onProgress?.('Refining mesh…');
-  const refined = s.refineTargetFaces > 0 ? refineToTarget(model, s.refineTargetFaces).mesh : model;
   onProgress?.('Building topology…');
-  const topo = buildTopology(orientMesh(refined));
+  const origTopo = buildTopology(orientMesh(model));
+  onProgress?.('Refining mesh…');
+  const refined = s.refineTargetFaces > 0 ? refineToTarget(origTopo, s.refineTargetFaces) : null;
+  const topo = refined && refined.levels > 0 ? buildTopology(refined.mesh) : origTopo;
+  const edgeStripWidth = refined && refined.levels > 0 ? inheritedStripWidth(topo, refined.lineage, origTopo) : topo.edgeStripWidth;
   // Develop the neutral surface: the model is assumed to be the OUTER (grain)
   // surface by default, so the neutral axis sits inward.
   const depth = s.surfaceMode === 'outer' ? -spec.neutralAxisDepthMm : s.surfaceMode === 'inner' ? spec.thicknessMm - spec.neutralAxisDepthMm : 0;
   const developed = offsetMesh(topo, depth).positions;
+  // segmentation may planarise gore seams by nudging vertices; keep the displayed mesh in step
+  const displayPositions = Float64Array.from(topo.mesh.positions);
+  const displayTopo: MeshTopology = { ...topo, mesh: { ...topo.mesh, positions: displayPositions } };
   const params = {
     ...defaultSegmentationParams(developed),
     minBendRadiusMm: spec.minBendRadiusMm,
@@ -78,9 +88,15 @@ export function runPipeline(model: TriMesh, spec: LeatherSpec, s: PipelineSettin
     stretchLimit: effectiveStretchLimit(spec, s),
     preferDarts: s.simplicity >= 0.35,
     mergePieces: true,
+    regularSeams: s.regularSeams,
+    goreAxis: s.goreAxis,
     maxSplits: s.maxSplits,
     forcedSeamEdges: s.forcedSeamEdges,
     forbiddenSeamEdges: s.forbiddenSeamEdges,
+    edgeStripWidth,
+    origTopo: refined && refined.levels > 0 ? origTopo : undefined,
+    faceChildren: refined ? 4 ** refined.levels : 1,
+    displayPositions,
     onProgress,
   };
   const seg = segmentMesh(topo, params);
@@ -91,7 +107,7 @@ export function runPipeline(model: TriMesh, spec: LeatherSpec, s: PipelineSettin
     rawEdgeAllowanceMm: s.rawEdgeAllowanceMm,
     smoothCutLines: s.smoothCutLines,
   };
-  const pattern = buildPattern(topo, seg, developed, topo.mesh.positions, spec, popts);
+  const pattern = buildPattern(displayTopo, seg, developed, displayPositions, spec, popts);
   layoutPieces(pattern, s.layout);
-  return { topo, developed, seg, pattern, warnings: [...seg.warnings, ...pattern.warnings] };
+  return { topo: displayTopo, developed, seg, pattern, warnings: [...seg.warnings, ...pattern.warnings] };
 }

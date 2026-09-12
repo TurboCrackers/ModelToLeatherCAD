@@ -18,13 +18,30 @@ export interface SegmentationParams {
   preferDarts: boolean;
   /** after refinement, greedily merge small pieces back into neighbours when the leather allows */
   mergePieces: boolean;
+  /** cut smoothly curved regions into regular gores around an axis instead of ad-hoc paths */
+  regularSeams: boolean;
+  /** gore axis: auto (flattest direction of the region, else model Y), or a fixed model axis */
+  goreAxis: 'auto' | 'x' | 'y' | 'z';
   forcedSeamEdges: Set<number>;
   forbiddenSeamEdges: Set<number>;
+  /** strip width per edge for bend-radius estimates (defaults to the topology's own) */
+  edgeStripWidth?: Float64Array;
+  /** when the mesh was refined: the original topology and children-per-face count (4^levels) so tightness is judged per ORIGINAL face */
+  origTopo?: MeshTopology;
+  faceChildren?: number;
+  /** displayed (un-offset) positions, snapped together with `positions` when gore seams are planarised */
+  displayPositions?: Float64Array;
   onProgress?: (msg: string) => void;
 }
 
 /** ARAP iterations while searching for cuts/merges; the final pattern is re-flattened at full quality. */
 const SEARCH_ITERATIONS = 4;
+/** the gore check decides the piece count, so it gets a more converged flatten */
+const GORE_ITERATIONS = 8;
+/** original edge ids created by regular gore cuts in the current run (kept out of the merge pass) */
+const goreEdges = new Set<number>();
+/** components already verified inside the gore check for the current run */
+let preValidated: Array<{ faces: Int32Array; flat: FlattenResult }> = [];
 const FINAL_ITERATIONS = 14;
 
 export const EDGE_SMOOTH = 0;
@@ -64,6 +81,8 @@ export const defaultSegmentationParams = (positions: Float64Array): Segmentation
   defectThresholdRad: 0.15,
   preferDarts: false,
   mergePieces: true,
+  regularSeams: true,
+  goreAxis: 'auto',
   forcedSeamEdges: new Set(),
   forbiddenSeamEdges: new Set(),
 });
@@ -201,6 +220,280 @@ function componentInfo(ct: MeshTopology, faces: Int32Array): ComponentInfo {
   return { inSet, boundaryVerts, interiorEdges };
 }
 
+/** Eigen-decomposition of a symmetric 3×3 matrix (Jacobi). Returns eigenvalues ascending with vectors. */
+function eigen3(M: number[][]): { values: number[]; vectors: number[][] } {
+  const a = M.map((r) => r.slice());
+  const v = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let sweep = 0; sweep < 50; sweep++) {
+    let off = 0;
+    for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) off += a[i][j] * a[i][j];
+    if (off < 1e-22) break;
+    for (let p = 0; p < 3; p++) for (let q = p + 1; q < 3; q++) {
+      if (Math.abs(a[p][q]) < 1e-300) continue;
+      const theta = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+      const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+      const c = 1 / Math.sqrt(t * t + 1), sn = t * c;
+      for (let k = 0; k < 3; k++) {
+        const akp = a[k][p], akq = a[k][q];
+        a[k][p] = c * akp - sn * akq; a[k][q] = sn * akp + c * akq;
+      }
+      for (let k = 0; k < 3; k++) {
+        const apk = a[p][k], aqk = a[q][k];
+        a[p][k] = c * apk - sn * aqk; a[q][k] = sn * apk + c * aqk;
+      }
+      for (let k = 0; k < 3; k++) {
+        const vkp = v[k][p], vkq = v[k][q];
+        v[k][p] = c * vkp - sn * vkq; v[k][q] = sn * vkp + c * vkq;
+      }
+    }
+  }
+  const order = [0, 1, 2].sort((i, j) => a[i][i] - a[j][j]);
+  return { values: order.map((i) => a[i][i]), vectors: order.map((i) => [v[0][i], v[1][i], v[2][i]]) };
+}
+
+/**
+ * Regular gores: split a smoothly curved component with N equally spaced
+ * planes through an axis (plus optionally the perpendicular "equator"),
+ * choosing the fewest gores that meet the strain limit and rotating the set
+ * so seams fall on the most curved spots. Returns ORIGINAL edge ids, or null.
+ */
+interface GoreResult { edges: number[]; ok: boolean; snap?: GoreSnap }
+/** Everything needed to move gore-seam vertices exactly onto their cutting planes. */
+interface GoreSnap { c: number[]; axis: number[]; e1: number[]; e2: number[]; angleOf: Map<number, number>; equatorVerts: Set<number> }
+
+function goreCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams, faces: Int32Array, seams: Set<number>): GoreResult | null {
+  const ct = cut.topo;
+  const info = componentInfo(ct, faces);
+  // gores are for the large smooth regions; small leftovers use the cheap fallback cuts
+  if (faces.length < 8 || faces.length < 0.15 * ct.mesh.nf) return null;
+  // area-weighted centroid & covariance of face centroids
+  let A = 0; const c = [0, 0, 0];
+  for (const f of faces) { const w = ct.faceAreas[f]; A += w; for (let k = 0; k < 3; k++) c[k] += ct.faceCentroids[3 * f + k] * w; }
+  for (let k = 0; k < 3; k++) c[k] /= A || 1;
+  const C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (const f of faces) {
+    const w = ct.faceAreas[f];
+    const d = [ct.faceCentroids[3 * f] - c[0], ct.faceCentroids[3 * f + 1] - c[1], ct.faceCentroids[3 * f + 2] - c[2]];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) C[i][j] += w * d[i] * d[j];
+  }
+  const eig = eigen3(C);
+  let axis: number[];
+  if (params.goreAxis === 'x') axis = [1, 0, 0];
+  else if (params.goreAxis === 'y') axis = [0, 1, 0];
+  else if (params.goreAxis === 'z') axis = [0, 0, 1];
+  else {
+    // pick the axis the region is most rotationally symmetric about: for a surface of
+    // revolution every face normal is coplanar with the axis, i.e. n · (axis × r) = 0
+    const cands: number[][] = [[0, 1, 0], [1, 0, 0], [0, 0, 1], ...eig.vectors];
+    let bestScore = Infinity; axis = [0, 1, 0];
+    for (const ax of cands) {
+      let sc = 0;
+      for (const f of faces) {
+        const r = [ct.faceCentroids[3 * f] - c[0], ct.faceCentroids[3 * f + 1] - c[1], ct.faceCentroids[3 * f + 2] - c[2]];
+        const t = [ax[1] * r[2] - ax[2] * r[1], ax[2] * r[0] - ax[0] * r[2], ax[0] * r[1] - ax[1] * r[0]];
+        const tl = Math.hypot(t[0], t[1], t[2]);
+        if (tl < 1e-9) continue;
+        const d = (ct.faceNormals[3 * f] * t[0] + ct.faceNormals[3 * f + 1] * t[1] + ct.faceNormals[3 * f + 2] * t[2]) / tl;
+        // second term: band-like shapes (box walls) have normals perpendicular to their natural axis
+        const na = ct.faceNormals[3 * f] * ax[0] + ct.faceNormals[3 * f + 1] * ax[1] + ct.faceNormals[3 * f + 2] * ax[2];
+        sc += ct.faceAreas[f] * (d * d + na * na);
+      }
+      if (sc < bestScore * 0.95) { bestScore = sc; axis = ax; }
+    }
+  }
+  const al = Math.hypot(axis[0], axis[1], axis[2]) || 1; axis = axis.map((v) => v / al);
+  // orthonormal frame
+  const ref = Math.abs(axis[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+  let e1 = [ref[1] * axis[2] - ref[2] * axis[1], ref[2] * axis[0] - ref[0] * axis[2], ref[0] * axis[1] - ref[1] * axis[0]];
+  const l1 = Math.hypot(e1[0], e1[1], e1[2]) || 1; e1 = e1.map((v) => v / l1);
+  const e2 = [axis[1] * e1[2] - axis[2] * e1[1], axis[2] * e1[0] - axis[0] * e1[2], axis[0] * e1[1] - axis[1] * e1[0]];
+  const theta = new Float64Array(ct.mesh.nf), height = new Float64Array(ct.mesh.nf);
+  const BINS = 72;
+  const hist = new Float64Array(BINS);
+  for (const f of faces) {
+    const d = [ct.faceCentroids[3 * f] - c[0], ct.faceCentroids[3 * f + 1] - c[1], ct.faceCentroids[3 * f + 2] - c[2]];
+    const x = d[0] * e1[0] + d[1] * e1[1] + d[2] * e1[2], y = d[0] * e2[0] + d[1] * e2[1] + d[2] * e2[2];
+    theta[f] = Math.atan2(y, x);
+    height[f] = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+    // curvature concentration: dihedral of the face's edges
+    let curv = 0;
+    for (let k = 0; k < 3; k++) curv += orig.dihedral[cut.origEdge[ct.faceEdges[3 * f + k]]];
+    hist[Math.floor(((theta[f] + Math.PI) / (2 * Math.PI)) * BINS) % BINS] += curv;
+  }
+  const trySectors = (N: number, equator: boolean): { edges: number[]; maxStrain: number; ok: boolean; snap: GoreSnap } => {
+    // phase that puts the N seams on the most curved angles
+    let bestPhi = 0, bestScore = -1;
+    for (let b = 0; b < BINS; b++) {
+      let sc = 0;
+      for (let k = 0; k < N; k++) sc += hist[(b + Math.round((k * BINS) / N)) % BINS];
+      if (sc > bestScore) { bestScore = sc; bestPhi = ((b + 0.5) / BINS) * 2 * Math.PI - Math.PI; }
+    }
+    const label = new Int32Array(ct.mesh.nf).fill(-1);
+    const wrapA = (f: number) => { let a = theta[f] - bestPhi; return ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI); };
+    for (const f of faces) label[f] = Math.floor((wrapA(f) / (2 * Math.PI)) * N) % N + (equator && height[f] < 0 ? N : 0);
+    if (N === 1) {
+      // a single cut along the φ ray: label faces by which side of the ray they sit on so the
+      // boundary is exactly the crossing edges (opens a ring into a strip)
+      for (const f of faces) label[f] = wrapA(f) < Math.PI ? 0 : 1;
+      const edges: number[] = [];
+      const angleOf = new Map<number, number>();
+      for (const e of info.interiorEdges) {
+        if (params.forbiddenSeamEdges.has(cut.origEdge[e])) continue;
+        const f = ct.edgeFaces[2 * e], g = ct.edgeFaces[2 * e + 1];
+        const a = wrapA(f), b = wrapA(g);
+        if (Math.abs(a - b) > Math.PI) {
+          edges.push(cut.origEdge[e]);
+          angleOf.set(cut.origVertex[ct.edgeVerts[2 * e]], bestPhi);
+          angleOf.set(cut.origVertex[ct.edgeVerts[2 * e + 1]], bestPhi);
+        }
+      }
+      const snap: GoreSnap = { c, axis, e1, e2, angleOf, equatorVerts: new Set() };
+      if (!edges.length) return { edges, maxStrain: Infinity, ok: false, snap };
+      const trySeams = new Set(seams); for (const e of edges) trySeams.add(e);
+      const tryCut = cutMeshAlongEdges(orig, params.positions, trySeams);
+      const comps = componentsOf(tryCut.topo, faces, () => true);
+      let maxStrain = 0, ok = true;
+      const flats: Array<{ faces: Int32Array; flat: FlattenResult }> = [];
+      for (const comp of comps) {
+        let fl = flattenPatch(tryCut.topo, tryCut.topo.mesh.positions, comp, GORE_ITERATIONS);
+        if (fl.maxStrain > params.stretchLimit && fl.maxStrain < params.stretchLimit * 1.3) fl = flattenPatch(tryCut.topo, tryCut.topo.mesh.positions, comp, FINAL_ITERATIONS);
+        const inf = componentInfo(tryCut.topo, comp);
+        if (inf.boundaryVerts.size === 0 || fl.flippedFaces > 0 || fl.maxStrain > params.stretchLimit) ok = false;
+        maxStrain = Math.max(maxStrain, fl.maxStrain);
+        if (!ok) break;
+        flats.push({ faces: comp, flat: fl });
+      }
+      if (ok) preValidated.push(...flats);
+      return { edges, maxStrain, ok, snap };
+    }
+    // majority-vote cleanup so boundaries are clean edge paths
+    for (let it = 0; it < 4; it++) {
+      let changed = 0;
+      for (const f of faces) {
+        const counts = new Map<number, number>();
+        for (let k = 0; k < 3; k++) {
+          const e = ct.faceEdges[3 * f + k];
+          if (!info.interiorEdges.has(e)) continue;
+          const g = otherFace(ct, e, f);
+          if (g >= 0) counts.set(label[g], (counts.get(label[g]) ?? 0) + 1);
+        }
+        let best = label[f], bc = counts.get(label[f]) ?? 0;
+        for (const [l, n] of counts) if (n > bc) { bc = n; best = l; }
+        if (best !== label[f] && bc >= 2) { label[f] = best; changed++; }
+      }
+      if (!changed) break;
+    }
+    const edges: number[] = [];
+    const angleOf = new Map<number, number>();
+    const conflict = new Set<number>();
+    const equatorVerts = new Set<number>();
+    const setAngle = (ov: number, a: number) => {
+      const prev = angleOf.get(ov);
+      if (prev !== undefined && Math.abs(Math.atan2(Math.sin(prev - a), Math.cos(prev - a))) > 1e-6) conflict.add(ov);
+      else angleOf.set(ov, a);
+    };
+    for (const e of info.interiorEdges) {
+      if (params.forbiddenSeamEdges.has(cut.origEdge[e])) continue;
+      const la = label[ct.edgeFaces[2 * e]], lb = label[ct.edgeFaces[2 * e + 1]];
+      if (la === lb) continue;
+      edges.push(cut.origEdge[e]);
+      const va = cut.origVertex[ct.edgeVerts[2 * e]], vb = cut.origVertex[ct.edgeVerts[2 * e + 1]];
+      const sa = la % N, sb = lb % N;
+      if (sa === sb) { equatorVerts.add(va); equatorVerts.add(vb); continue; }
+      let k = -1;
+      if ((sa + 1) % N === sb) k = sb; else if ((sb + 1) % N === sa) k = sa;
+      if (k < 0) { conflict.add(va); conflict.add(vb); continue; }
+      const a = bestPhi + (k * 2 * Math.PI) / N;
+      setAngle(va, a); setAngle(vb, a);
+    }
+    for (const v of conflict) { angleOf.delete(v); }
+    const snap: GoreSnap = { c, axis, e1, e2, angleOf, equatorVerts };
+    if (!edges.length) return { edges, maxStrain: Infinity, ok: false, snap };
+    const trySeams = new Set(seams); for (const e of edges) trySeams.add(e);
+    const tryCut = cutMeshAlongEdges(orig, params.positions, trySeams);
+    const comps = componentsOf(tryCut.topo, faces, () => true);
+    let maxStrain = 0, ok = true;
+    const flats: Array<{ faces: Int32Array; flat: FlattenResult }> = [];
+    for (const comp of comps) {
+      let fl = flattenPatch(tryCut.topo, tryCut.topo.mesh.positions, comp, GORE_ITERATIONS);
+      // near miss: confirm with a fully converged flatten before rejecting this gore count
+      if (fl.maxStrain > params.stretchLimit && fl.maxStrain < params.stretchLimit * 1.3) fl = flattenPatch(tryCut.topo, tryCut.topo.mesh.positions, comp, FINAL_ITERATIONS);
+      const inf = componentInfo(tryCut.topo, comp);
+      if (inf.boundaryVerts.size === 0 || fl.flippedFaces > 0) ok = false;
+      maxStrain = Math.max(maxStrain, fl.maxStrain);
+      if (fl.maxStrain > params.stretchLimit) ok = false;
+      if (!ok) break;
+      flats.push({ faces: comp, flat: fl });
+    }
+    if (ok) preValidated.push(...flats);
+    return { edges, maxStrain, ok, snap };
+  };
+  let best: { edges: number[]; maxStrain: number; ok: boolean; snap: GoreSnap } | null = null;
+  for (const equator of [false, true]) {
+    let stale = 0, prev = Infinity;
+    for (let N = !equator && info.boundaryVerts.size > 0 ? 1 : 2; N <= (equator ? 8 : 12); N++) {
+      params.onProgress?.(`Trying ${N} regular gores${equator ? ' + equator' : ''}…`);
+      const r = trySectors(N, equator);
+      params.onProgress?.(`Gores ${N}${equator ? '+eq' : ''}: max strain ${(r.maxStrain * 100).toFixed(1)}% ${r.ok ? 'ok' : 'fail'} (${r.edges.length} edges)`);
+      if (r.ok) return { edges: r.edges, ok: true, snap: r.snap };
+      if (!best || r.maxStrain < best.maxStrain) best = r;
+      // stop when more gores stop helping (e.g. a torus: sectors stay doubly curved)
+      stale = r.maxStrain > prev * 0.9 ? stale + 1 : 0;
+      prev = Math.min(prev, r.maxStrain);
+      if (stale >= 2) break;
+    }
+    if (best && best.maxStrain > params.stretchLimit * 4) break; // hopeless: skip the equator series
+  }
+  return best ? { edges: best.edges, ok: false } : null;
+}
+
+/** Move gore-seam vertices onto their cutting planes (rotation about the axis; equator → axis height 0). */
+function applyGoreSnap(orig: MeshTopology, params: SegmentationParams, snap: GoreSnap): void {
+  const arrays = [params.positions, params.displayPositions].filter((a): a is Float64Array => !!a);
+  const { c, axis, e1, e2 } = snap;
+  const idx = orig.mesh.indices;
+  const faceNormal = (arr: Float64Array, f: number): number[] => {
+    const a = idx[3 * f], b = idx[3 * f + 1], d = idx[3 * f + 2];
+    const u = [arr[3 * b] - arr[3 * a], arr[3 * b + 1] - arr[3 * a + 1], arr[3 * b + 2] - arr[3 * a + 2]];
+    const w = [arr[3 * d] - arr[3 * a], arr[3 * d + 1] - arr[3 * a + 1], arr[3 * d + 2] - arr[3 * a + 2]];
+    return [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+  };
+  /** move vertex v to p unless one of its faces would flip or collapse */
+  const tryMove = (arr: Float64Array, v: number, p: number[]): void => {
+    const before = Array.from(csrRange(orig.vertexFaces, v)).map((f) => faceNormal(arr, f));
+    const old = [arr[3 * v], arr[3 * v + 1], arr[3 * v + 2]];
+    arr[3 * v] = p[0]; arr[3 * v + 1] = p[1]; arr[3 * v + 2] = p[2];
+    let ok = true;
+    Array.from(csrRange(orig.vertexFaces, v)).forEach((f, i) => {
+      const n = faceNormal(arr, f), b = before[i];
+      const dot = n[0] * b[0] + n[1] * b[1] + n[2] * b[2];
+      const lb = Math.hypot(b[0], b[1], b[2]), ln = Math.hypot(n[0], n[1], n[2]);
+      if (lb > 0 && (ln < 0.2 * lb || dot / (lb * ln) < 0.3)) ok = false;
+    });
+    if (!ok) { arr[3 * v] = old[0]; arr[3 * v + 1] = old[1]; arr[3 * v + 2] = old[2]; }
+  };
+  for (const arr of arrays) {
+    for (const [v, a] of snap.angleOf) {
+      const d = [arr[3 * v] - c[0], arr[3 * v + 1] - c[1], arr[3 * v + 2] - c[2]];
+      const h = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+      const x = d[0] * e1[0] + d[1] * e1[1] + d[2] * e1[2], y = d[0] * e2[0] + d[1] * e2[1] + d[2] * e2[2];
+      const r = Math.hypot(x, y);
+      if (r < 1e-6) continue; // on the axis (pole): leave
+      const cur = Math.atan2(y, x);
+      const delta = Math.atan2(Math.sin(a - cur), Math.cos(a - cur));
+      if (Math.abs(delta) > Math.PI / 6) continue; // never rotate far: something else is going on here
+      const nx = r * Math.cos(a), ny = r * Math.sin(a);
+      tryMove(arr, v, [0, 1, 2].map((k) => c[k] + axis[k] * h + e1[k] * nx + e2[k] * ny));
+    }
+    for (const v of snap.equatorVerts) {
+      if (snap.angleOf.has(v)) continue;
+      const d = [arr[3 * v] - c[0], arr[3 * v + 1] - c[1], arr[3 * v + 2] - c[2]];
+      const h = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+      tryMove(arr, v, [0, 1, 2].map((k) => arr[3 * v + k] - axis[k] * h));
+    }
+  }
+}
+
 /**
  * Decide where to cut a component that is not yet developable enough.
  * Returns ORIGINAL edge ids to add to the seam set.
@@ -233,6 +526,11 @@ function chooseCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams,
         const p = pathEdges(ct, dj.prev, worst, b);
         if (p.edges.length) return toOrig(p.edges);
       }
+    }
+    // (b0) distributed curvature, regular style: gores around an axis
+    if (params.regularSeams) {
+      const g = goreCut(orig, cut, params, faces, seams);
+      if (g && g.ok) { for (const e of g.edges) goreEdges.add(e); if (g.snap) applyGoreSnap(orig, params, g.snap); return g.edges; }
     }
     // (b) distributed curvature: cut through the most central / most strained vertex to two sides
     const fromBoundary = dijkstra(ct, Array.from(info.boundaryVerts), allowed, new Set());
@@ -302,9 +600,27 @@ function chooseCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams,
           const smallest = Math.min(...groups.map((g) => g.length));
           // accept a through-cut when it splits reasonably, otherwise use just the dart leg
           if (groups.length >= 2 && smallest >= Math.max(params.minPatchFaces, faces.length * 0.08)) return toOrig(edges);
+          // a rim-to-rim cut that does not disconnect still opens a ring (annulus → strip)
+          if (b2 >= 0 && groups.length === 1) return toOrig(edges);
           return toOrig(p1.edges);
         }
       }
+    }
+  }
+  if (params.regularSeams && info.boundaryVerts.size === 0) {
+    // gores only suit smoothly distributed curvature; a closed box-like shape has corner
+    // defects that darts must relieve after a plane split
+    let concentrated = false;
+    const seenV = new Set<number>();
+    for (const f of faces) for (let k = 0; k < 3; k++) {
+      const cv = ct.mesh.indices[3 * f + k];
+      if (seenV.has(cv)) continue;
+      seenV.add(cv);
+      if (Math.abs(orig.angleDefect[cut.origVertex[cv]]) > params.defectThresholdRad) { concentrated = true; break; }
+    }
+    if (!concentrated) {
+      const g = goreCut(orig, cut, params, faces, seams);
+      if (g && g.ok) { for (const e of g.edges) goreEdges.add(e); if (g.snap) applyGoreSnap(orig, params, g.snap); return g.edges; }
     }
   }
   // (c) closed surface (or nothing else worked): plane split along the principal axis
@@ -406,13 +722,26 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
     const th = topo.dihedral[e];
     if (th < flatAngle) continue;
     if (th >= creaseAngle) { if (!params.canCreaseFold) hard[e] = 1; continue; }
-    if (estimateBendRadius(th, topo.edgeStripWidth[e]) < params.minBendRadiusMm) isTightEdge[e] = 1;
+    if (estimateBendRadius(th, (params.edgeStripWidth ?? topo.edgeStripWidth)[e]) < params.minBendRadiusMm) isTightEdge[e] = 1;
   }
   const tightFace = new Uint8Array(nf);
-  for (let e = 0; e < topo.ne; e++) {
-    if (!isTightEdge[e]) continue;
-    tightFace[topo.edgeFaces[2 * e]] = 1;
-    tightFace[topo.edgeFaces[2 * e + 1]] = 1;
+  if (params.origTopo && params.faceChildren && params.faceChildren > 1) {
+    // judge tightness on the original mesh, then inherit per refined child face
+    const ot = params.origTopo;
+    const tightOrig = new Uint8Array(ot.mesh.nf);
+    for (let e = 0; e < ot.ne; e++) {
+      if (ot.edgeFaces[2 * e + 1] < 0) continue;
+      const th = ot.dihedral[e];
+      if (th < flatAngle || th >= creaseAngle) continue;
+      if (estimateBendRadius(th, ot.edgeStripWidth[e]) < params.minBendRadiusMm) { tightOrig[ot.edgeFaces[2 * e]] = 1; tightOrig[ot.edgeFaces[2 * e + 1]] = 1; }
+    }
+    for (let f = 0; f < nf; f++) tightFace[f] = tightOrig[Math.floor(f / params.faceChildren)];
+  } else {
+    for (let e = 0; e < topo.ne; e++) {
+      if (!isTightEdge[e]) continue;
+      tightFace[topo.edgeFaces[2 * e]] = 1;
+      tightFace[topo.edgeFaces[2 * e + 1]] = 1;
+    }
   }
   const isHard = (e: number) => hard[e] === 1;
 
@@ -464,6 +793,8 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
   }
 
   const protectedSeams = new Set(seams);
+  goreEdges.clear();
+  preValidated = [];
 
   // ---- 3. cut → flatten → refine
   const validated = new Uint8Array(nf);
@@ -488,7 +819,9 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
       }
       for (const f of faces) validated[f] = 0;
       params.onProgress?.(`Flattening piece ${patches.length + 1} (${faces.length} faces)…`);
-      const flat = flattenPatch(ct, ct.mesh.positions, faces, SEARCH_ITERATIONS);
+      let flat = flattenPatch(ct, ct.mesh.positions, faces, SEARCH_ITERATIONS);
+      // near miss: confirm with a converged flatten before cutting further
+      if ((flat.maxStrain > params.stretchLimit && flat.maxStrain < params.stretchLimit * 1.3) || flat.flippedFaces > 0) flat = flattenPatch(ct, ct.mesh.positions, faces, FINAL_ITERATIONS);
       const info = componentInfo(ct, faces);
       const closed = info.boundaryVerts.size === 0;
       const ok = !closed && flat.flippedFaces === 0 && flat.maxStrain <= params.stretchLimit;
@@ -510,6 +843,12 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
     }
     if (cutsThisRound === 0) break;
     cut = cutMeshAlongEdges(topo, params.positions, seams);
+    // pieces verified by the gore check need no second judgement (avoids flaky re-cuts at the limit)
+    for (const pv of preValidated) {
+      let minF = Infinity; for (const f of pv.faces) { if (f < minF) minF = f; validated[f] = 1; }
+      flatCache.set(minF, pv.flat);
+    }
+    preValidated = [];
   }
   // ---- 4. merge pass: absorb small pieces into neighbours (and remove darts) when the leather allows
   if (params.mergePieces) {
@@ -520,7 +859,7 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
       // shared removable edges per patch pair (pa <= pb; pa === pb is a dart)
       const shared = new Map<string, number[]>();
       for (const e of seams) {
-        if (protectedSeams.has(e)) continue;
+        if (protectedSeams.has(e) || goreEdges.has(e)) continue;
         const pa = f2p[topo.edgeFaces[2 * e]], pb = f2p[topo.edgeFaces[2 * e + 1]];
         const key = pa <= pb ? `${pa}_${pb}` : `${pb}_${pa}`;
         let arr = shared.get(key);
@@ -547,7 +886,8 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
           // cheap prune: integrated Gaussian curvature of the union's interior predicts the strain
           if (predictedStrain(topo, tryCut, comps[0]) > params.stretchLimit * 1.6) continue;
           params.onProgress?.(`Trying to merge pieces (${union.length} faces)…`);
-          const flat = flattenPatch(tryCut.topo, tryCut.topo.mesh.positions, comps[0], SEARCH_ITERATIONS);
+          let flat = flattenPatch(tryCut.topo, tryCut.topo.mesh.positions, comps[0], SEARCH_ITERATIONS);
+          if ((flat.maxStrain > params.stretchLimit && flat.maxStrain < params.stretchLimit * 1.3) || flat.flippedFaces > 0) flat = flattenPatch(tryCut.topo, tryCut.topo.mesh.positions, comps[0], FINAL_ITERATIONS);
           const info = componentInfo(tryCut.topo, comps[0]);
           const ok = info.boundaryVerts.size > 0 && flat.flippedFaces === 0 && flat.maxStrain <= params.stretchLimit;
           if (!ok) continue;
@@ -595,3 +935,6 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
   }
   return { cut, faceToPatch, patches, edgeClass, warnings, splits };
 }
+
+/** test hook */
+export function componentInfoForTest(ct: MeshTopology, faces: Int32Array): number { return componentInfo(ct, faces).boundaryVerts.size; }

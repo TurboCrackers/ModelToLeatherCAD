@@ -97,6 +97,8 @@ class App {
     const gap = el('input', { type: 'number', value: 8, min: 0, step: 1, onChange: () => { this.settings.layout.gapMm = parseFloat(gap.value) || 0; this.scheduleRecompute('pattern'); } });
     const smoothCb = el('input', { type: 'checkbox', checked: true, onChange: () => { this.settings.smoothCutLines = smoothCb.checked; this.scheduleRecompute('pattern'); } });
     const refine = el('input', { type: 'number', value: 3000, min: 0, max: 60000, step: 1000, onChange: () => { this.settings.refineTargetFaces = parseInt(refine.value) || 0; this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.scheduleRecompute('full'); } });
+    const regular = el('input', { type: 'checkbox', checked: true, onChange: () => { this.settings.regularSeams = regular.checked; this.scheduleRecompute('full'); } });
+    const goreAxis = el('select', { onChange: () => { this.settings.goreAxis = goreAxis.value as any; this.scheduleRecompute('full'); } }, option('auto', 'Auto (flattest direction / Y)'), option('x', 'X axis'), option('y', 'Y axis'), option('z', 'Z axis'));
     const auto = el('input', { type: 'checkbox', checked: true, onChange: () => (this.autoUpdate = auto.checked) });
     const recompute = el('button', { class: 'primary', onClick: () => this.recompute('full') }, 'Recompute pattern');
     const reset = el('button', { onClick: () => { this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.recompute('full'); } }, 'Reset manual edits');
@@ -134,6 +136,7 @@ class App {
         el('div', { class: 'row' }, labeled('Crease angle (°)', crease, 'Dihedral above this is a fold/corner'), labeled('Stretch limit (%)', stretch)),
         el('div', { class: 'row' }, labeled('Stitches per inch', spi), labeled('Edge margin (mm)', margin), labeled('Allowance (mm)', allowance)),
         el('div', { class: 'row' }, labeled('Raw-edge hem (mm)', hem), labeled('Max auto cuts', maxSplits)),
+        el('div', { class: 'row' }, el('label', { class: 'row', style: { fontSize: '12px', alignItems: 'center' } }, regular, el('span', { style: { flex: 6 } }, 'Regular seams: cut curved regions into equal gores')), labeled('Gore axis', goreAxis)),
         el('div', { class: 'row' }, labeled('Refine mesh to ≥ triangles', refine, 'Subdivides coarse models so cuts can follow smooth paths. More = slower.'), el('label', { class: 'row', style: { fontSize: '12px', alignItems: 'center' } }, smoothCb, el('span', { style: { flex: 6 } }, 'Smooth cut lines (corners kept)'))),
         el('div', { class: 'row' }, labeled('Sheet width (mm, 0 = auto)', sheetW), labeled('Piece gap (mm)', gap)),
         el('div', { class: 'row' }, recompute, reset),
