@@ -57,8 +57,11 @@ export class Viewer {
   private h1!: Float32Array;
   private h2!: Float32Array;
   private holeRadius = 1;
-  private seamEdgeVerts: number[] = []; // pairs of cut vertices
-  private seamEdgeIds: number[] = [];
+  private seamEdgeIds: number[] = []; // seam id per line segment
+  private line0!: Float32Array; // seam line segment endpoints, 3 states
+  private line1!: Float32Array;
+  private line2!: Float32Array;
+  private lineCur!: Float32Array;
   private foldEdgeVerts: number[] = [];
   private pieceVerts: number[][] = [];
   private origToCut: Map<number, number> = new Map();
@@ -136,9 +139,9 @@ export class Viewer {
       const P = new THREE.Vector3(), A = new THREE.Vector3(), B = new THREE.Vector3(), C = new THREE.Vector3();
       P.copy(pt);
       for (let i = 0; i < this.seamEdgeIds.length; i++) {
-        const a = this.seamEdgeVerts[2 * i], b = this.seamEdgeVerts[2 * i + 1];
-        A.set(this.cur[3 * a], this.cur[3 * a + 1], this.cur[3 * a + 2]);
-        B.set(this.cur[3 * b], this.cur[3 * b + 1], this.cur[3 * b + 2]);
+        if (this.seamEdgeIds[i] < 0) continue;
+        A.set(this.lineCur[6 * i], this.lineCur[6 * i + 1], this.lineCur[6 * i + 2]);
+        B.set(this.lineCur[6 * i + 3], this.lineCur[6 * i + 4], this.lineCur[6 * i + 5]);
         new THREE.Line3(A, B).closestPointToPoint(P, true, C);
         const d = C.distanceTo(P);
         if (!nearest || d < nearest.dist) nearest = { id: this.seamEdgeIds[i], dist: d };
@@ -226,22 +229,34 @@ export class Viewer {
     this.mesh = new THREE.Mesh(geom, mat);
     this.root.add(this.mesh);
 
-    // seam lines (all cut-mesh boundary edges that are seams) & fold lines
-    this.seamEdgeVerts = []; this.seamEdgeIds = []; this.foldEdgeVerts = [];
-    const seamOfOrigEdge = new Int32Array(topo.ne).fill(-1);
-    pattern.seams.forEach((s) => s.origEdges.forEach((e) => (seamOfOrigEdge[e] = s.id)));
+    // seam / raw-edge lines from the smoothed pattern runs (3 states per point), fold lines from mesh edges
+    this.seamEdgeIds = []; this.foldEdgeVerts = [];
+    const l0: number[] = [], l1: number[] = [], l2: number[] = [];
+    for (const pc of pattern.pieces) {
+      const d = explodeDir[pc.id];
+      for (const run of pc.runs) {
+        for (let i = 0; i < run.pts2.length - 1; i++) {
+          for (const j of [i, i + 1]) {
+            const p3 = run.pts3[j];
+            l0.push(p3[0], p3[1], p3[2]);
+            l1.push(p3[0] + d[0] * explodeDist, p3[1] + d[1] * explodeDist, p3[2] + d[2] * explodeDist);
+            const l = toLayout(pc, run.pts2[j]);
+            const f = flatPos(l[0], l[1], 0.2);
+            l2.push(f[0], f[1], f[2]);
+          }
+          this.seamEdgeIds.push(run.seamId);
+        }
+      }
+    }
+    this.line0 = Float32Array.from(l0); this.line1 = Float32Array.from(l1); this.line2 = Float32Array.from(l2);
     for (let e = 0; e < ct.ne; e++) {
       const oe = cut.origEdge[e];
-      const a = ct.edgeVerts[2 * e], b = ct.edgeVerts[2 * e + 1];
-      if (ct.edgeFaces[2 * e + 1] < 0) {
-        if (seamOfOrigEdge[oe] >= 0) { this.seamEdgeVerts.push(a, b); this.seamEdgeIds.push(seamOfOrigEdge[oe]); }
-        else { this.seamEdgeVerts.push(a, b); this.seamEdgeIds.push(-1); }
-      } else if (seg.edgeClass[oe] === EDGE_FOLD) this.foldEdgeVerts.push(a, b);
+      if (ct.edgeFaces[2 * e + 1] >= 0 && seg.edgeClass[oe] === EDGE_FOLD) this.foldEdgeVerts.push(ct.edgeVerts[2 * e], ct.edgeVerts[2 * e + 1]);
     }
     void otherFace;
     const seamGeom = new THREE.BufferGeometry();
-    seamGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3 * this.seamEdgeVerts.length), 3));
-    const seamColors = new Float32Array(3 * this.seamEdgeVerts.length);
+    seamGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.line0.length), 3));
+    const seamColors = new Float32Array(this.line0.length);
     for (let i = 0; i < this.seamEdgeIds.length; i++) {
       const id = this.seamEdgeIds[i];
       const c = id >= 0 ? (pattern.seams[id].type === 'turned' ? new THREE.Color(0xffd166) : new THREE.Color(0xff7b54)) : new THREE.Color(0xdddddd);
@@ -340,8 +355,7 @@ export class Viewer {
     if (this.selectedSeam !== null) {
       for (let i = 0; i < this.seamEdgeIds.length; i++) {
         if (this.seamEdgeIds[i] !== this.selectedSeam) continue;
-        const a = this.seamEdgeVerts[2 * i], b = this.seamEdgeVerts[2 * i + 1];
-        pts.push(this.cur[3 * a], this.cur[3 * a + 1], this.cur[3 * a + 2], this.cur[3 * b], this.cur[3 * b + 1], this.cur[3 * b + 2]);
+        for (let k = 0; k < 6; k++) pts.push(this.lineCur[6 * i + k]);
       }
     }
     this.highlightLine.geometry.dispose();
@@ -400,7 +414,16 @@ export class Viewer {
       (line.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
       line.geometry.computeBoundingSphere();
     };
-    fill(this.seamLines, this.seamEdgeVerts);
+    if (this.seamLines) {
+      const arr = (this.seamLines.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array;
+      for (let i = 0; i < arr.length; i++) {
+        const e = this.line0[i] + (this.line1[i] - this.line0[i]) * a;
+        arr[i] = e + (this.line2[i] - e) * b;
+      }
+      this.lineCur = arr;
+      (this.seamLines.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+      this.seamLines.geometry.computeBoundingSphere();
+    }
     fill(this.foldLines, this.foldEdgeVerts);
     // holes
     if (this.holes) {

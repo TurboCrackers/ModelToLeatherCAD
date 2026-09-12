@@ -95,6 +95,8 @@ class App {
     const allowance = el('input', { type: 'number', step: 0.5, min: 0, max: 30, placeholder: 'auto', onChange: () => { const v = parseFloat(allowance.value); this.overrides.seamAllowanceMm = isFinite(v) && allowance.value !== '' ? v : undefined; this.refreshLeatherUI(); this.scheduleRecompute('pattern'); } });
     const sheetW = el('input', { type: 'number', value: 0, min: 0, step: 10, onChange: () => { this.settings.layout.sheetWidthMm = parseFloat(sheetW.value) || 0; this.scheduleRecompute('pattern'); } });
     const gap = el('input', { type: 'number', value: 8, min: 0, step: 1, onChange: () => { this.settings.layout.gapMm = parseFloat(gap.value) || 0; this.scheduleRecompute('pattern'); } });
+    const smoothCb = el('input', { type: 'checkbox', checked: true, onChange: () => { this.settings.smoothCutLines = smoothCb.checked; this.scheduleRecompute('pattern'); } });
+    const refine = el('input', { type: 'number', value: 3000, min: 0, max: 60000, step: 1000, onChange: () => { this.settings.refineTargetFaces = parseInt(refine.value) || 0; this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.scheduleRecompute('full'); } });
     const auto = el('input', { type: 'checkbox', checked: true, onChange: () => (this.autoUpdate = auto.checked) });
     const recompute = el('button', { class: 'primary', onClick: () => this.recompute('full') }, 'Recompute pattern');
     const reset = el('button', { onClick: () => { this.settings.forcedSeamEdges.clear(); this.settings.forbiddenSeamEdges.clear(); this.settings.seamTypeOverrides.clear(); this.recompute('full'); } }, 'Reset manual edits');
@@ -132,6 +134,7 @@ class App {
         el('div', { class: 'row' }, labeled('Crease angle (°)', crease, 'Dihedral above this is a fold/corner'), labeled('Stretch limit (%)', stretch)),
         el('div', { class: 'row' }, labeled('Stitches per inch', spi), labeled('Edge margin (mm)', margin), labeled('Allowance (mm)', allowance)),
         el('div', { class: 'row' }, labeled('Raw-edge hem (mm)', hem), labeled('Max auto cuts', maxSplits)),
+        el('div', { class: 'row' }, labeled('Refine mesh to ≥ triangles', refine, 'Subdivides coarse models so cuts can follow smooth paths. More = slower.'), el('label', { class: 'row', style: { fontSize: '12px', alignItems: 'center' } }, smoothCb, el('span', { style: { flex: 6 } }, 'Smooth cut lines (corners kept)'))),
         el('div', { class: 'row' }, labeled('Sheet width (mm, 0 = auto)', sheetW), labeled('Piece gap (mm)', gap)),
         el('div', { class: 'row' }, recompute, reset),
         el('label', { class: 'row', style: { fontSize: '12px' } }, auto, el('span', { style: { flex: 6 } }, 'Recompute automatically when settings change')),

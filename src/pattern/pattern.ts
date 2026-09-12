@@ -1,8 +1,9 @@
 import { MeshTopology, CutMesh, otherFace } from '../geometry/mesh';
 import { SegmentationResult, Patch, EDGE_FOLD } from '../geometry/segmentation';
 import { LeatherSpec, SeamType } from '../leather/physics';
-import { V2, V3, sub2, add2, scale2, perp2, norm2, len2, sub3, add3, scale3, norm3, dot3, lerp3 } from '../geometry/vec';
-import { signedArea, polygonCentroid, offsetPolygon, polygonSelfIntersects, removeSelfIntersections } from './geometry2d';
+import { V2, V3, add2, scale2, perp2, len2, sub3, add3, scale3, norm3, dot3, lerp3 } from '../geometry/vec';
+import { signedArea, polygonCentroid, offsetPolygon, polygonSelfIntersects, removeSelfIntersections, pointAtArc } from './geometry2d';
+import { planSmoothing, applySmoothing, SmoothPlan, polylineLength } from './smooth';
 
 export interface BoundaryEdge {
   cutEdge: number;
@@ -38,6 +39,10 @@ export interface Seam {
   chain3D: V3[];
   /** same chain on the displayed model surface */
   chainDisplay: V3[];
+  /** smoothing decided on the shared chain and applied identically to both sides */
+  plan: SmoothPlan;
+  /** smoothed display-surface curve (assembled state) */
+  smoothDisplay: V3[];
   arc: number[];
   length: number;
   sideA: SeamSide;
@@ -47,6 +52,14 @@ export interface Seam {
   pitch: number;
   allowanceMm: number;
   insetMm: number;
+}
+
+export interface PieceRun {
+  seamId: number; // -1 for a raw edge
+  /** piece-local 2D points, loop travel order */
+  pts2: V2[];
+  /** matching points on the displayed 3D surface */
+  pts3: V3[];
 }
 
 export interface Hole {
@@ -68,6 +81,8 @@ export interface Piece {
   outlines: V2[][];
   /** cut outlines after seam allowance */
   cutOutlines: V2[][];
+  /** smoothed boundary runs in loop order: the drawn seam / raw-edge curves */
+  runs: PieceRun[];
   holes: Hole[];
   foldLines: Array<[V2, V2]>;
   seamLabels: Array<{ seamId: number; p: V2; text: string }>;
@@ -86,6 +101,8 @@ export interface PatternOptions {
   seamTypeOverrides: Map<string, SeamType>;
   /** allowance added to raw (unsewn) edges, e.g. for hems. */
   rawEdgeAllowanceMm: number;
+  /** smooth the zig-zag mesh-edge seams into curves with corners where needed */
+  smoothCutLines: boolean;
 }
 
 export interface PatternSet {
@@ -183,7 +200,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     const outlines = loops.map(poly);
     const areaMm2 = outlines.length ? Math.abs(signedArea(outlines[outerIdx])) - outlines.filter((_, j) => j !== outerIdx).reduce((s, o) => s + Math.abs(signedArea(o)), 0) : 0;
     return {
-      id: i, name: pieceName(i), patch, uv, loops, outlines, cutOutlines: [], holes: [], foldLines: [], seamLabels: [], notches: [],
+      id: i, name: pieceName(i), patch, uv, loops, outlines, cutOutlines: [], runs: [], holes: [], foldLines: [], seamLabels: [], notches: [],
       areaMm2, centroid: outlines.length ? polygonCentroid(outlines[outerIdx]) : [0, 0], overStrained: patch.overStrained, tightBend: patch.tightBend,
       maxStrain: patch.flat.maxStrain, layout: { angle: 0, tx: 0, ty: 0 },
     };
@@ -210,34 +227,38 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
       if (e.neighborPatch < 0 || assigned.has(e.origEdge)) continue;
       const p0 = partnerOf(pi, lj, k);
       if (!p0) continue;
-      // walk backwards to the run start
+      // walk backwards to the run start (never across a dart tip: the same original edge twice)
       let start = k;
       let guard = 0;
+      const inRun = new Set<number>([e.origEdge]);
       while (guard++ < n) {
         const prevIdx = (start - 1 + n) % n;
         const pe = lp.edges[prevIdx];
-        if (pe.neighborPatch < 0 || assigned.has(pe.origEdge) || prevIdx === k) break;
+        if (pe.neighborPatch < 0 || assigned.has(pe.origEdge) || prevIdx === k || inRun.has(pe.origEdge)) break;
         const pp = partnerOf(pi, lj, prevIdx);
         const cp = partnerOf(pi, lj, start);
         if (!pp || !cp || pp.piece !== cp.piece || pp.loop !== cp.loop) break;
         const m = pieces[pp.piece].loops[pp.loop].edges.length;
         if (pp.index !== (cp.index + 1) % m) break;
         start = prevIdx;
+        inRun.add(pe.origEdge);
       }
-      // walk forwards to collect the run
-      const run: number[] = [start];
+      // the run so far: start .. k (in loop order); then walk forwards from k
+      const run: number[] = [];
+      for (let i = start; ; i = (i + 1) % n) { run.push(i); if (i === k) break; }
       guard = 0;
       while (guard++ < n) {
         const cur = run[run.length - 1];
         const nextIdx = (cur + 1) % n;
         if (nextIdx === start) break;
         const ne = lp.edges[nextIdx];
-        if (ne.neighborPatch < 0 || assigned.has(ne.origEdge)) break;
+        if (ne.neighborPatch < 0 || assigned.has(ne.origEdge) || inRun.has(ne.origEdge)) break;
         const cp = partnerOf(pi, lj, cur), np = partnerOf(pi, lj, nextIdx);
         if (!cp || !np || cp.piece !== np.piece || cp.loop !== np.loop) break;
         const m = pieces[np.piece].loops[np.loop].edges.length;
         if (np.index !== (cp.index - 1 + m) % m) break;
         run.push(nextIdx);
+        inRun.add(ne.origEdge);
       }
       const first = partnerOf(pi, lj, run[0])!;
       const last = partnerOf(pi, lj, run[run.length - 1])!;
@@ -258,8 +279,11 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
       };
       pushV(lp.edges[run[0]].from);
       for (const r of run) pushV(lp.edges[r].to);
+      const plan: SmoothPlan = opts.smoothCutLines ? planSmoothing(chain3D) : { keep: chain3D.map((_, k) => k), corners: chain3D.map(() => true), subdiv: 1 };
+      const smooth3D = applySmoothing(chain3D, plan) as V3[];
+      const smoothDisplay = applySmoothing(chainDisplay, plan) as V3[];
       const arc = [0];
-      for (let i = 1; i < chain3D.length; i++) arc.push(arc[i - 1] + Math.hypot(...sub3(chain3D[i], chain3D[i - 1])));
+      for (let i = 1; i < smooth3D.length; i++) arc.push(arc[i - 1] + Math.hypot(...sub3(smooth3D[i], smooth3D[i - 1])));
       const length = arc[arc.length - 1];
       const pitch = spec.stitchPitchMm;
       const endMargin = Math.min(pitch, Math.max(pitch * 0.5, spec.edgeMarginMm * 0.8));
@@ -273,7 +297,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
         for (let i = 0; i < count; i++) holeArc.push(s0 + i * pitch);
       }
       const seam: Seam = {
-        id, label: `${id + 1}`, type, isDart: first.piece === pi, origEdges, chain3D, chainDisplay, arc, length, sideA, sideB, holeArc, pitch,
+        id, label: `${id + 1}`, type, isDart: first.piece === pi, origEdges, chain3D, chainDisplay, plan, smoothDisplay, arc, length, sideA, sideB, holeArc, pitch,
         allowanceMm: type === 'turned' ? spec.seamAllowanceMm : 0,
         insetMm: type === 'turned' ? 0 : spec.edgeMarginMm,
       };
@@ -284,22 +308,107 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     }
   }));
 
-  // ---- per piece: holes, allowance outline, folds, labels
-  const holeRadius = spec.holeDiameterMm / 2;
+  // ---- per piece: smoothed runs → outlines, allowance, holes, folds, labels
   for (const pc of pieces) {
     const li = pc.patch.flat.localIndex;
     const P = (cv: number): V2 => { const l = li.get(cv)!; return [pc.uv[2 * l], pc.uv[2 * l + 1]]; };
-    pc.cutOutlines = pc.loops.map((lp) => {
-      const poly = lp.edges.map((e) => P(e.from));
-      const offs = lp.edges.map((e) => {
-        if (e.seamId < 0) return opts.rawEdgeAllowanceMm;
-        return seams[e.seamId].allowanceMm;
-      });
-      const off = offsetPolygon(poly, offs);
-      return offs.some((o) => o > 0) ? removeSelfIntersections(off) : off;
+    const D = (cv: number): V3 => { const ov = cut.origVertex[cv]; return [display[3 * ov], display[3 * ov + 1], display[3 * ov + 2]]; };
+    const newOutlines: V2[][] = [];
+    const newCut: V2[][] = [];
+    pc.loops.forEach((lp) => {
+      const n = lp.edges.length;
+      // split the loop into runs: consecutive edges of the same seam side, or raw edges
+      const sideOf = (k: number): string => {
+        const e = lp.edges[k];
+        if (e.seamId < 0) return 'raw';
+        const sm = seams[e.seamId];
+        const inA = (side: SeamSide) => side.patchId === pc.id && side.loopIndex === pc.loops.indexOf(lp) && ((k - side.start + n) % n) < side.count;
+        return `${e.seamId}:${inA(sm.sideA) ? 'A' : 'B'}`;
+      };
+      // start at a run boundary
+      let start = 0;
+      for (let k = 0; k < n; k++) if (sideOf(k) !== sideOf((k - 1 + n) % n)) { start = k; break; }
+      const runs: Array<{ key: string; idx: number[] }> = [];
+      for (let c = 0; c < n; c++) {
+        const k = (start + c) % n;
+        const key = sideOf(k);
+        if (runs.length && runs[runs.length - 1].key === key) runs[runs.length - 1].idx.push(k);
+        else runs.push({ key, idx: [k] });
+      }
+      const outline: V2[] = [];
+      const offs: number[] = [];
+      for (const run of runs) {
+        const edges = run.idx.map((k) => lp.edges[k]);
+        const seamId = edges[0].seamId;
+        let pts2: V2[], pts3: V3[];
+        if (seamId >= 0) {
+          const sm = seams[seamId];
+          const isA = run.key.endsWith('A');
+          // chain-order 2D points, then the shared plan
+          const chainEdges = isA ? edges : edges.slice().reverse();
+          const c2: V2[] = [P(isA ? chainEdges[0].from : chainEdges[0].to)];
+          for (const e of chainEdges) c2.push(P(isA ? e.to : e.from));
+          const s2 = applySmoothing(c2, sm.plan) as V2[];
+          const s3 = sm.smoothDisplay;
+          pts2 = isA ? s2 : s2.slice().reverse();
+          pts3 = isA ? s3 : s3.slice().reverse();
+          // holes for this side, positioned by arc fraction of the shared smoothed chain
+          const L2 = polylineLength(s2), L3 = sm.length || 1;
+          for (const sArc of sm.holeArc) {
+            const { p, dir } = pointAtArc(s2, (sArc / L3) * L2);
+            const left = perp2(dir);
+            const inward = isA ? left : scale2(left, -1);
+            const p2 = add2(p, scale2(inward, sm.insetMm));
+            // 3D: point on the smooth display curve, nudged toward the piece side
+            let acc = 0, i3 = 0;
+            for (; i3 < s3.length - 2; i3++) { const l = Math.hypot(...sub3(s3[i3 + 1], s3[i3])); if (acc + l >= sArc) break; acc += l; }
+            const segL = Math.hypot(...sub3(s3[i3 + 1], s3[i3])) || 1;
+            const f = Math.min(1, Math.max(0, (sArc - acc) / segL));
+            const base = lerp3(s3[i3], s3[i3 + 1], f);
+            const ref = chainEdges[Math.min(chainEdges.length - 1, Math.floor((sArc / L3) * chainEdges.length))];
+            const fc: V3 = [ct.faceCentroids[3 * ref.face], ct.faceCentroids[3 * ref.face + 1], ct.faceCentroids[3 * ref.face + 2]];
+            const cvs = [ct.mesh.indices[3 * ref.face], ct.mesh.indices[3 * ref.face + 1], ct.mesh.indices[3 * ref.face + 2]];
+            const cd: V3 = [0, 0, 0];
+            for (const cv of cvs) { const d = D(cv); cd[0] += d[0] / 3; cd[1] += d[1] / 3; cd[2] += d[2] / 3; }
+            void fc;
+            const tdir = norm3(sub3(s3[i3 + 1], s3[i3]));
+            let w = sub3(cd, base);
+            w = norm3(sub3(w, scale3(tdir, dot3(w, tdir))));
+            pc.holes.push({ seamId, p: p2, p3: add3(base, scale3(w, sm.insetMm)) });
+          }
+          // label and notches
+          const mid = pointAtArc(s2, L2 / 2);
+          const midInward = isA ? perp2(mid.dir) : scale2(perp2(mid.dir), -1);
+          pc.seamLabels.push({ seamId, p: add2(mid.p, scale2(midInward, sm.insetMm + Math.max(4, spec.edgeMarginMm + 2))), text: sm.isDart ? `D${sm.label}` : sm.label });
+          const notchLen = sm.allowanceMm + 3;
+          for (const q of [pointAtArc(s2, 0), pointAtArc(s2, L2)]) {
+            const out = isA ? scale2(perp2(q.dir), -1) : perp2(q.dir);
+            pc.notches.push([q.p, add2(q.p, scale2(out, notchLen))]);
+          }
+        } else {
+          const c2: V2[] = [P(edges[0].from)];
+          const c3: V3[] = [D(edges[0].from)];
+          for (const e of edges) { c2.push(P(e.to)); c3.push(D(e.to)); }
+          const plan = opts.smoothCutLines ? planSmoothing(c3) : { keep: c3.map((_, k) => k), corners: c3.map(() => true), subdiv: 1 };
+          pts2 = applySmoothing(c2, plan) as V2[];
+          pts3 = applySmoothing(c3, plan) as V3[];
+        }
+        pc.runs.push({ seamId, pts2, pts3 });
+        const allowance = seamId >= 0 ? seams[seamId].allowanceMm : opts.rawEdgeAllowanceMm;
+        for (let i = 0; i < pts2.length - 1; i++) { outline.push(pts2[i]); offs.push(allowance); }
+      }
+      newOutlines.push(outline);
+      const off = offsetPolygon(outline, offs);
+      newCut.push(offs.some((o) => o > 0) ? removeSelfIntersections(off) : off);
     });
-    if (pc.cutOutlines.length && polygonSelfIntersects(pc.cutOutlines[pc.loops.findIndex((l) => l.isOuter)] ?? []))
-      warnings.push(`Piece ${pc.name}: cut outline self-intersects (check seam allowance vs. shape).`);
+    pc.outlines = newOutlines;
+    pc.cutOutlines = newCut;
+    const outerIdx = pc.loops.findIndex((l) => l.isOuter);
+    if (outerIdx >= 0 && newOutlines[outerIdx]) {
+      pc.areaMm2 = Math.abs(signedArea(newOutlines[outerIdx])) - newOutlines.filter((_, j) => j !== outerIdx).reduce((a, o) => a + Math.abs(signedArea(o)), 0);
+      pc.centroid = polygonCentroid(newOutlines[outerIdx]);
+      if (polygonSelfIntersects(newCut[outerIdx] ?? [])) warnings.push(`Piece ${pc.name}: cut outline self-intersects (check seam allowance vs. shape).`);
+    }
     // folds
     const seen = new Set<number>();
     for (const f of pc.patch.faces) for (let k = 0; k < 3; k++) {
@@ -311,79 +420,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
       pc.foldLines.push([P(ct.edgeVerts[2 * ce]), P(ct.edgeVerts[2 * ce + 1])]);
     }
   }
-  for (const seam of seams) {
-    for (const side of [seam.sideA, seam.sideB]) {
-      const pc = pieces[side.patchId];
-      const lp = pc.loops[side.loopIndex];
-      const n = lp.edges.length;
-      const li = pc.patch.flat.localIndex;
-      const P = (cv: number): V2 => { const l = li.get(cv)!; return [pc.uv[2 * l], pc.uv[2 * l + 1]]; };
-      // side-A travel order polyline and matching 3D arc per edge
-      const isA = side === seam.sideA;
-      const runEdges: BoundaryEdge[] = [];
-      for (let i = 0; i < side.count; i++) runEdges.push(lp.edges[(side.start + i) % n]);
-      // For side B the loop runs opposite to the chain; build the 2D polyline in chain order.
-      const pts2: V2[] = [];
-      const inward: V2[] = [];
-      if (isA) {
-        pts2.push(P(runEdges[0].from));
-        for (const e of runEdges) pts2.push(P(e.to));
-      } else {
-        const rev = runEdges.slice().reverse();
-        pts2.push(P(rev[0].to));
-        for (const e of rev) pts2.push(P(e.from));
-      }
-      // inward normal per chain segment: left of travel in this piece's own loop direction
-      for (let i = 0; i < pts2.length - 1; i++) {
-        const d = norm2(sub2(pts2[i + 1], pts2[i]));
-        const left = perp2(d);
-        inward.push(isA ? left : scale2(left, -1));
-      }
-      const placeAt = (s: number): { p: V2; i: number; f: number } => {
-        let i = 0;
-        while (i < seam.arc.length - 2 && s > seam.arc[i + 1]) i++;
-        const segLen = seam.arc[i + 1] - seam.arc[i];
-        const f = segLen > 0 ? Math.min(1, Math.max(0, (s - seam.arc[i]) / segLen)) : 0;
-        const p: V2 = [pts2[i][0] + (pts2[i + 1][0] - pts2[i][0]) * f, pts2[i][1] + (pts2[i + 1][1] - pts2[i][1]) * f];
-        return { p, i, f };
-      };
-      const faceInward3 = (edgeIdx: number): V3 => {
-        const e = isA ? runEdges[edgeIdx] : runEdges[runEdges.length - 1 - edgeIdx];
-        const f = e.face;
-        const a = seam.chainDisplay[edgeIdx], b = seam.chainDisplay[edgeIdx + 1];
-        const dir = norm3(sub3(b, a));
-        const c: V3 = [ct.faceCentroids[3 * f], ct.faceCentroids[3 * f + 1], ct.faceCentroids[3 * f + 2]];
-        // centroid of the developed face: use the original developed positions via cut vertices
-        const cv = [ct.mesh.indices[3 * f], ct.mesh.indices[3 * f + 1], ct.mesh.indices[3 * f + 2]].map((v) => cut.origVertex[v]);
-        const cd: V3 = [0, 0, 0];
-        for (const ov of cv) { cd[0] += display[3 * ov] / 3; cd[1] += display[3 * ov + 1] / 3; cd[2] += display[3 * ov + 2] / 3; }
-        void c;
-        const mid = lerp3(a, b, 0.5);
-        let w = sub3(cd, mid);
-        w = sub3(w, scale3(dir, dot3(w, dir)));
-        return norm3(w);
-      };
-      for (const s of seam.holeArc) {
-        const { p, i, f } = placeAt(s);
-        const p2 = add2(p, scale2(inward[i], seam.insetMm));
-        const p3base = lerp3(seam.chainDisplay[i], seam.chainDisplay[i + 1], f);
-        const p3 = add3(p3base, scale3(faceInward3(i), seam.insetMm));
-        pc.holes.push({ seamId: seam.id, p: p2, p3 });
-      }
-      // label at mid-run, pushed inside
-      const mid = placeAt(seam.length / 2);
-      const labelP = add2(mid.p, scale2(inward[mid.i], seam.insetMm + Math.max(4, spec.edgeMarginMm + 2)));
-      pc.seamLabels.push({ seamId: seam.id, p: labelP, text: seam.isDart ? `D${seam.label}` : seam.label });
-      // notches at both ends, drawn outward across the cut line
-      const notchLen = seam.allowanceMm + 3;
-      for (const s of [0, seam.length]) {
-        const { p, i } = placeAt(s);
-        const out = scale2(inward[i], -1);
-        pc.notches.push([p, add2(p, scale2(out, notchLen))]);
-      }
-    }
-  }
-  void holeRadius; void len2;
+  void len2;
 
   const totalAreaMm2 = pieces.reduce((s, p) => s + p.areaMm2, 0);
   return { pieces, seams, spec, warnings, sheet: { w: 0, h: 0 }, totalAreaMm2 };

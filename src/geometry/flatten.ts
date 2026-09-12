@@ -144,7 +144,7 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
     }
   }
   const x = new Float64Array(2 * nFree);
-  if (nFree > 0) pcgSolve(N.build(), rhs, x, 1e-10, 6000);
+  if (nFree > 0) pcgSolve(N.build(), rhs, x, 3e-5, 1200);
   for (let i = 0; i < nv; i++) {
     const fi = freeIndex[i];
     if (fi >= 0) { uv[2 * i] = x[2 * fi]; uv[2 * i + 1] = x[2 * fi + 1]; }
@@ -215,8 +215,8 @@ export function flattenPatch(topo: MeshTopology, positions: Float64Array, faceId
     }
     bu[anchor] += anchorW * U[anchor];
     bv[anchor] += anchorW * Vv[anchor];
-    pcgSolve(L, bu, U, 1e-9, 3000);
-    pcgSolve(L, bv, Vv, 1e-9, 3000);
+    pcgSolve(L, bu, U, 1e-5, 800);
+    pcgSolve(L, bv, Vv, 1e-5, 800);
   }
   for (let i = 0; i < nv; i++) { uv[2 * i] = U[i]; uv[2 * i + 1] = Vv[i]; }
 

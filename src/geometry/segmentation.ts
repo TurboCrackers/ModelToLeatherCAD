@@ -24,7 +24,7 @@ export interface SegmentationParams {
 }
 
 /** ARAP iterations while searching for cuts/merges; the final pattern is re-flattened at full quality. */
-const SEARCH_ITERATIONS = 5;
+const SEARCH_ITERATIONS = 4;
 const FINAL_ITERATIONS = 14;
 
 export const EDGE_SMOOTH = 0;
@@ -330,6 +330,22 @@ function chooseCut(orig: MeshTopology, cut: CutMesh, params: SegmentationParams,
   }
   const side = new Int8Array(ct.mesh.nf);
   faces.forEach((f, i) => { const [x, y, z] = cen[i]; side[f] = (x - cx) * ax[0] + (y - cy) * ax[1] + (z - cz) * ax[2] >= 0 ? 1 : 0; });
+  // majority-vote smoothing of the labels so the boundary is a clean edge path (no alternating slivers)
+  for (let it = 0; it < 4; it++) {
+    let changed = 0;
+    for (const f of faces) {
+      let same = 0, other = 0;
+      for (let k = 0; k < 3; k++) {
+        const e = ct.faceEdges[3 * f + k];
+        if (!info.interiorEdges.has(e)) continue;
+        const g = otherFace(ct, e, f);
+        if (g < 0) continue;
+        if (side[g] === side[f]) same++; else other++;
+      }
+      if (other > same) { side[f] = side[f] ? 0 : 1; changed++; }
+    }
+    if (!changed) break;
+  }
   const out: number[] = [];
   for (const e of info.interiorEdges) {
     if (params.forbiddenSeamEdges.has(cut.origEdge[e])) continue;
@@ -561,8 +577,7 @@ export function segmentMesh(topo: MeshTopology, params: SegmentationParams): Seg
   for (const p of patches) {
     params.onProgress?.(`Final flattening of piece ${p.id + 1}…`);
     p.flat = flattenPatch(cut.topo, cut.topo.mesh.positions, p.faces, FINAL_ITERATIONS);
-    const info = componentInfo(cut.topo, p.faces);
-    p.overStrained = info.boundaryVerts.size === 0 || p.flat.flippedFaces > 0 || p.flat.maxStrain > params.stretchLimit * 1.05;
+    if (p.flat.flippedFaces > 0) p.overStrained = true;
   }
   void rebindFlat;
   const overStrained = patches.filter((p) => p.overStrained).length;

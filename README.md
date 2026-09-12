@@ -40,8 +40,9 @@ The pipeline is in `src/pattern/pipeline.ts`:
    - closed surfaces get a **plane split**.
    Softer, stretchier leather therefore yields fewer, larger pieces; firm veg-tan yields more.
 6. **Seams & holes** – boundary loops are traced on the cut mesh and paired by original edge, including darts (a seam between a piece and itself). Stitch holes are placed by 3D arc length along the shared seam curve at the leather's pitch, centred with end margins, so both sides always get the same number of holes at the same positions. Turned seams put the holes on the stitch line and add the allowance outside it; butted seams put the cut edge on the seam and inset the holes by the edge margin. Dart wedges on turned seams are folded rather than cut (the offset outline is untangled).
-7. **Merging** – small pieces are greedily merged into neighbours (and darts removed) when the union still flattens within the limit; only automatically created seams are candidates, physically required ones stay.
-8. **Nesting** – pieces are rotated to their minimal bounding box and shelf-packed into the sheet.
+7. **Smooth cut lines** – cuts follow mesh edges, which zig-zags on regular meshes. Each seam's shared 3D chain is simplified (Douglas–Peucker at about one edge length, which removes staircases but keeps genuine corners), corners are detected by turning angle, and a Catmull-Rom curve is run through the remaining points between corners. The same kept points and curve are applied to both sides of the seam, so lengths and holes stay matched. Imported meshes are first refined by midpoint subdivision to at least the *refine mesh* target (default 3000 triangles; corners are preserved exactly) so cuts have fine paths to follow.
+8. **Merging** – small pieces are greedily merged into neighbours (and darts removed) when the union still flattens within the limit; only automatically created seams are candidates, physically required ones stay.
+9. **Nesting** – pieces are rotated to their minimal bounding box and shelf-packed into the sheet.
 
 ## Leather catalogue
 
@@ -51,7 +52,7 @@ The values are engineering estimates distilled from leathercraft practice and ty
 
 ## Notes and limits
 
-- Meshes should be manifold-ish triangle surfaces; very coarse meshes (a 12-triangle box) give coarse cut lines because cuts follow mesh edges. Subdivide such models first.
+- Meshes should be manifold-ish triangle surfaces. Coarse meshes are refined automatically; raise the refine target for smoother curves at the cost of compute time, or set it to 0 to keep the mesh as imported.
 - Flattening cost grows with piece size; models of a few thousand triangles compute in well under a second, tens of thousands take seconds.
 - Global overlap of a flattened piece with itself is only detected through flipped triangles and outline self-intersection warnings.
 - Stitch hole positions on the 3D model are shown on the seam curve (turned) or inset along the surface (butted) for visualisation.

@@ -1,4 +1,5 @@
 import { TriMesh, buildTopology, orientMesh, offsetMesh, MeshTopology } from '../geometry/mesh';
+import { refineToTarget } from '../geometry/subdivide';
 import { segmentMesh, SegmentationResult, defaultSegmentationParams } from '../geometry/segmentation';
 import { buildPattern, PatternSet, PatternOptions } from './pattern';
 import { layoutPieces, LayoutOptions } from './layout';
@@ -19,6 +20,9 @@ export interface PipelineSettings {
   seamType: SeamType | 'auto';
   seamTypeOverrides: Map<string, SeamType>;
   rawEdgeAllowanceMm: number;
+  smoothCutLines: boolean;
+  /** subdivide the imported mesh until it has at least this many triangles (0 = never) */
+  refineTargetFaces: number;
   forcedSeamEdges: Set<number>;
   forbiddenSeamEdges: Set<number>;
   layout: LayoutOptions;
@@ -33,6 +37,8 @@ export const defaultPipelineSettings = (): PipelineSettings => ({
   seamType: 'auto',
   seamTypeOverrides: new Map(),
   rawEdgeAllowanceMm: 0,
+  smoothCutLines: true,
+  refineTargetFaces: 3000,
   forcedSeamEdges: new Set(),
   forbiddenSeamEdges: new Set(),
   layout: { gapMm: 8, sheetWidthMm: 0, marginMm: 10 },
@@ -56,8 +62,10 @@ export function effectiveStretchLimit(spec: LeatherSpec, s: PipelineSettings): n
 
 /** Model (mm) → developed neutral surface → segmentation → pattern → layout. */
 export function runPipeline(model: TriMesh, spec: LeatherSpec, s: PipelineSettings, onProgress?: (m: string) => void): PipelineResult {
+  onProgress?.('Refining mesh…');
+  const refined = s.refineTargetFaces > 0 ? refineToTarget(model, s.refineTargetFaces).mesh : model;
   onProgress?.('Building topology…');
-  const topo = buildTopology(orientMesh(model));
+  const topo = buildTopology(orientMesh(refined));
   // Develop the neutral surface: the model is assumed to be the OUTER (grain)
   // surface by default, so the neutral axis sits inward.
   const depth = s.surfaceMode === 'outer' ? -spec.neutralAxisDepthMm : s.surfaceMode === 'inner' ? spec.thicknessMm - spec.neutralAxisDepthMm : 0;
@@ -81,6 +89,7 @@ export function runPipeline(model: TriMesh, spec: LeatherSpec, s: PipelineSettin
     defaultSeamType: s.seamType === 'auto' ? spec.defaultSeamType : s.seamType,
     seamTypeOverrides: s.seamTypeOverrides,
     rawEdgeAllowanceMm: s.rawEdgeAllowanceMm,
+    smoothCutLines: s.smoothCutLines,
   };
   const pattern = buildPattern(topo, seg, developed, topo.mesh.positions, spec, popts);
   layoutPieces(pattern, s.layout);
