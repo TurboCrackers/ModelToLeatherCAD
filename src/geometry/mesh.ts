@@ -314,13 +314,49 @@ export function buildTopology(mesh: TriMesh): MeshTopology {
   };
 }
 
-/** Offset every vertex along its normal (negative = inward). Used to develop the neutral surface. */
+/**
+ * Offset the surface by `distance` (negative = inward) to develop the neutral
+ * surface. Each vertex moves to the point that lies at `distance` from all of
+ * its adjacent face planes (least squares, lightly regularised toward the
+ * averaged-normal offset). Flat faces stay exactly flat and corners stay
+ * sharp; on smooth meshes this reduces to the usual normal offset.
+ */
 export function offsetMesh(topo: MeshTopology, distance: number): TriMesh {
   const m = topo.mesh;
   const p = new Float64Array(m.positions.length);
-  for (let v = 0; v < m.nv; v++)
-    for (let k = 0; k < 3; k++) p[3 * v + k] = m.positions[3 * v + k] + topo.vertexNormals[3 * v + k] * distance;
+  const lambda = 0.05;
+  for (let v = 0; v < m.nv; v++) {
+    const nv: V3 = [topo.vertexNormals[3 * v], topo.vertexNormals[3 * v + 1], topo.vertexNormals[3 * v + 2]];
+    // distinct adjacent face normals (cluster within ~5°)
+    const normals: V3[] = [];
+    for (const f of csrRange(topo.vertexFaces, v)) {
+      const n: V3 = [topo.faceNormals[3 * f], topo.faceNormals[3 * f + 1], topo.faceNormals[3 * f + 2]];
+      if (!normals.some((q) => dot3(q, n) > 0.996)) normals.push(n);
+    }
+    // solve (Σ n nᵀ + λI) d = Σ n·distance + λ·nv·distance  for the displacement d
+    const A = [[lambda, 0, 0], [0, lambda, 0], [0, 0, lambda]];
+    const b = [lambda * nv[0] * distance, lambda * nv[1] * distance, lambda * nv[2] * distance];
+    for (const n of normals) {
+      for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) A[i][j] += n[i] * n[j]; b[i] += n[i] * distance; }
+    }
+    const d = solve3(A, b) ?? [nv[0] * distance, nv[1] * distance, nv[2] * distance];
+    // guard against spikes at very acute corners
+    const L = Math.hypot(d[0], d[1], d[2]);
+    const maxL = 3 * Math.abs(distance);
+    const sc = L > maxL ? maxL / L : 1;
+    for (let k = 0; k < 3; k++) p[3 * v + k] = m.positions[3 * v + k] + d[k] * sc;
+  }
   return { ...m, positions: p };
+}
+
+function solve3(A: number[][], b: number[]): number[] | null {
+  const [a, b1, c] = A[0], [d, e, f] = A[1], [g, h, i] = A[2];
+  const det = a * (e * i - f * h) - b1 * (d * i - f * g) + c * (d * h - e * g);
+  if (Math.abs(det) < 1e-14) return null;
+  const x = (b[0] * (e * i - f * h) - b1 * (b[1] * i - f * b[2]) + c * (b[1] * h - e * b[2])) / det;
+  const y = (a * (b[1] * i - f * b[2]) - b[0] * (d * i - f * g) + c * (d * b[2] - b[1] * g)) / det;
+  const z = (a * (e * b[2] - b[1] * h) - b1 * (d * b[2] - b[1] * g) + b[0] * (d * h - e * g)) / det;
+  return [x, y, z];
 }
 
 export function otherFace(topo: MeshTopology, e: number, f: number): number {

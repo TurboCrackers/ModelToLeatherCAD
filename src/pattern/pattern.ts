@@ -3,7 +3,7 @@ import { SegmentationResult, Patch, EDGE_FOLD } from '../geometry/segmentation';
 import { LeatherSpec, SeamType } from '../leather/physics';
 import { V2, V3, add2, scale2, perp2, len2, sub3, add3, scale3, norm3, dot3, lerp3 } from '../geometry/vec';
 import { signedArea, polygonCentroid, offsetPolygon, polygonSelfIntersects, removeSelfIntersections, pointAtArc } from './geometry2d';
-import { planSmoothing, applySmoothing, SmoothPlan, polylineLength } from './smooth';
+import { planSmoothing, applySmoothing, SmoothPlan, polylineLength, arcFractions, pointAtFraction } from './smooth';
 
 export interface BoundaryEdge {
   cutEdge: number;
@@ -83,6 +83,8 @@ export interface Piece {
   cutOutlines: V2[][];
   /** smoothed boundary runs in loop order: the drawn seam / raw-edge curves */
   runs: PieceRun[];
+  /** boundary cut-vertices snapped onto the smooth curves (display 3D), for the viewer */
+  boundaryDisplay: Map<number, V3>;
   holes: Hole[];
   foldLines: Array<[V2, V2]>;
   seamLabels: Array<{ seamId: number; p: V2; text: string }>;
@@ -112,6 +114,11 @@ export interface PatternSet {
   warnings: string[];
   sheet: { w: number; h: number };
   totalAreaMm2: number;
+}
+
+function identityPlan(n: number): SmoothPlan {
+  const corners = Array.from({ length: n }, (_, i) => i);
+  return { corners, fractions: Array.from({ length: Math.max(0, n - 1) }, () => [0, 1]), passes: 0 };
 }
 
 function pieceName(i: number): string {
@@ -200,7 +207,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     const outlines = loops.map(poly);
     const areaMm2 = outlines.length ? Math.abs(signedArea(outlines[outerIdx])) - outlines.filter((_, j) => j !== outerIdx).reduce((s, o) => s + Math.abs(signedArea(o)), 0) : 0;
     return {
-      id: i, name: pieceName(i), patch, uv, loops, outlines, cutOutlines: [], runs: [], holes: [], foldLines: [], seamLabels: [], notches: [],
+      id: i, name: pieceName(i), patch, uv, loops, outlines, cutOutlines: [], runs: [], boundaryDisplay: new Map(), holes: [], foldLines: [], seamLabels: [], notches: [],
       areaMm2, centroid: outlines.length ? polygonCentroid(outlines[outerIdx]) : [0, 0], overStrained: patch.overStrained, tightBend: patch.tightBend,
       maxStrain: patch.flat.maxStrain, layout: { angle: 0, tx: 0, ty: 0 },
     };
@@ -279,14 +286,16 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
       };
       pushV(lp.edges[run[0]].from);
       for (const r of run) pushV(lp.edges[r].to);
-      const plan: SmoothPlan = opts.smoothCutLines ? planSmoothing(chain3D) : { keep: chain3D.map((_, k) => k), corners: chain3D.map(() => true), subdiv: 1 };
+      const plan: SmoothPlan = opts.smoothCutLines ? planSmoothing(chain3D) : identityPlan(chain3D.length);
       const smooth3D = applySmoothing(chain3D, plan) as V3[];
       const smoothDisplay = applySmoothing(chainDisplay, plan) as V3[];
       const arc = [0];
       for (let i = 1; i < smooth3D.length; i++) arc.push(arc[i - 1] + Math.hypot(...sub3(smooth3D[i], smooth3D[i - 1])));
       const length = arc[arc.length - 1];
       const pitch = spec.stitchPitchMm;
-      const endMargin = Math.min(pitch, Math.max(pitch * 0.5, spec.edgeMarginMm * 0.8));
+      // keep the first/last hole clear of the seam ends so holes of seams meeting at a corner do not collide
+      const insetForMargin = type === 'turned' ? 0 : spec.edgeMarginMm;
+      const endMargin = Math.max(pitch * 0.6, insetForMargin + pitch * 0.5);
       const usable = Math.max(0, length - 2 * endMargin);
       let count = Math.floor(usable / pitch + 1e-6) + 1;
       if (length < 2 * spec.holeDiameterMm * 1.5) count = 0;
@@ -315,6 +324,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     const D = (cv: number): V3 => { const ov = cut.origVertex[cv]; return [display[3 * ov], display[3 * ov + 1], display[3 * ov + 2]]; };
     const newOutlines: V2[][] = [];
     const newCut: V2[][] = [];
+    const uvSnap = new Map<number, V2>();
     pc.loops.forEach((lp) => {
       const n = lp.edges.length;
       // split the loop into runs: consecutive edges of the same seam side, or raw edges
@@ -389,11 +399,24 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
           const c2: V2[] = [P(edges[0].from)];
           const c3: V3[] = [D(edges[0].from)];
           for (const e of edges) { c2.push(P(e.to)); c3.push(D(e.to)); }
-          const plan = opts.smoothCutLines ? planSmoothing(c3) : { keep: c3.map((_, k) => k), corners: c3.map(() => true), subdiv: 1 };
+          const plan = opts.smoothCutLines ? planSmoothing(c3) : identityPlan(c3.length);
           pts2 = applySmoothing(c2, plan) as V2[];
           pts3 = applySmoothing(c3, plan) as V3[];
         }
         pc.runs.push({ seamId, pts2, pts3 });
+        // snap the mesh boundary vertices of this run onto the smooth curves (loop order)
+        {
+          const verts: number[] = [edges[0].from];
+          for (const e of edges) verts.push(e.to);
+          const raw2 = verts.map((cv) => P(cv));
+          const fr = arcFractions(raw2);
+          verts.forEach((cv, j) => {
+            const q2 = pointAtFraction(pts2, fr[j]) as V2;
+            const q3 = pointAtFraction(pts3, fr[j]) as V3;
+            uvSnap.set(cv, q2);
+            pc.boundaryDisplay.set(cv, q3);
+          });
+        }
         const allowance = seamId >= 0 ? seams[seamId].allowanceMm : opts.rawEdgeAllowanceMm;
         for (let i = 0; i < pts2.length - 1; i++) { outline.push(pts2[i]); offs.push(allowance); }
       }
@@ -403,6 +426,7 @@ export function buildPattern(topo: MeshTopology, seg: SegmentationResult, develo
     });
     pc.outlines = newOutlines;
     pc.cutOutlines = newCut;
+    if (opts.smoothCutLines) for (const [cv, q] of uvSnap) { const l = li.get(cv)!; pc.uv[2 * l] = q[0]; pc.uv[2 * l + 1] = q[1]; }
     const outerIdx = pc.loops.findIndex((l) => l.isOuter);
     if (outerIdx >= 0 && newOutlines[outerIdx]) {
       pc.areaMm2 = Math.abs(signedArea(newOutlines[outerIdx])) - newOutlines.filter((_, j) => j !== outerIdx).reduce((a, o) => a + Math.abs(signedArea(o)), 0);

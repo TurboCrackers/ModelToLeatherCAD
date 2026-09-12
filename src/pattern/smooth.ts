@@ -1,9 +1,11 @@
 /**
  * Seam-line smoothing. Cuts follow mesh edges, which on regular meshes gives
- * staircase zig-zags. We simplify each seam chain (Douglas–Peucker at roughly
- * one edge length), keep genuine corners, and run a Catmull-Rom curve through
- * the remaining points. Both sides of a seam use the SAME kept indices and
- * the same curve construction, so their lengths and hole positions stay matched.
+ * staircase zig-zags. For each seam chain we (1) find genuine corners by
+ * measuring the turning angle over a window of several edge lengths, (2)
+ * resample every corner-to-corner span at uniform arc length and (3) smooth
+ * the samples with a Gaussian kernel, endpoints fixed. The plan (corner
+ * indices, sample fractions, kernel) is decided once on the shared 3D chain
+ * and applied identically to both 2D sides, so the sides stay matched.
  */
 
 type P = number[];
@@ -11,14 +13,30 @@ type P = number[];
 const sub = (a: P, b: P): P => a.map((v, i) => v - b[i]);
 const len = (a: P): number => Math.sqrt(a.reduce((s, v) => s + v * v, 0));
 const dot = (a: P, b: P): number => a.reduce((s, v, i) => s + v * b[i], 0);
+const lerp = (a: P, b: P, t: number): P => a.map((v, i) => v + (b[i] - v) * t);
+
+function cumulative(pts: P[]): number[] {
+  const arc = [0];
+  for (let i = 1; i < pts.length; i++) arc.push(arc[i - 1] + len(sub(pts[i], pts[i - 1])));
+  return arc;
+}
+
+function pointAt(pts: P[], arc: number[], s: number): P {
+  const L = arc[arc.length - 1];
+  if (s <= 0) return pts[0].slice();
+  if (s >= L) return pts[pts.length - 1].slice();
+  let lo = 0, hi = arc.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (arc[mid] <= s) lo = mid; else hi = mid; }
+  const seg = arc[hi] - arc[lo];
+  return lerp(pts[lo], pts[hi], seg > 0 ? (s - arc[lo]) / seg : 0);
+}
 
 function pointLineDistance(p: P, a: P, b: P): number {
   const ab = sub(b, a);
   const L2 = dot(ab, ab);
   if (L2 < 1e-18) return len(sub(p, a));
   const t = Math.max(0, Math.min(1, dot(sub(p, a), ab) / L2));
-  const proj = a.map((v, i) => v + ab[i] * t);
-  return len(sub(p, proj));
+  return len(sub(p, a.map((v, i) => v + ab[i] * t)));
 }
 
 /** Douglas–Peucker: indices of the points to keep (endpoints always kept). */
@@ -42,74 +60,100 @@ export function simplifyIndices(pts: P[], tol: number): number[] {
   return out;
 }
 
-/** True where the polyline turns more than `angleDeg`; endpoints are always corners. */
-export function cornerFlags(pts: P[], angleDeg: number): boolean[] {
-  const n = pts.length;
-  const flags = new Array<boolean>(n).fill(false);
-  if (n === 0) return flags;
-  flags[0] = true; flags[n - 1] = true;
-  const cosLimit = Math.cos((angleDeg * Math.PI) / 180);
-  for (let i = 1; i < n - 1; i++) {
-    const a = sub(pts[i], pts[i - 1]), b = sub(pts[i + 1], pts[i]);
-    const la = len(a), lb = len(b);
-    if (la < 1e-12 || lb < 1e-12) continue;
-    if (dot(a, b) / (la * lb) < cosLimit) flags[i] = true;
-  }
-  return flags;
+export interface SmoothPlan {
+  /** chain indices that stay fixed: endpoints and genuine corners */
+  corners: number[];
+  /** per span between consecutive corners: arc fractions (0..1) of the uniform samples */
+  fractions: number[][];
+  /** number of Gaussian passes over each span's interior samples */
+  passes: number;
 }
 
-/** Catmull-Rom through the points, broken (C0) at corners; `subdiv` samples per span. */
-export function splineThrough(pts: P[], corners: boolean[], subdiv: number): P[] {
-  const n = pts.length;
-  if (n < 2) return pts.map((p) => p.slice());
-  const out: P[] = [pts[0].slice()];
-  let start = 0;
-  for (let i = 1; i < n; i++) {
-    if (!corners[i]) continue;
-    // span start..i is one smooth run
-    const seg = pts.slice(start, i + 1);
-    if (seg.length === 2) out.push(seg[1].slice());
-    else {
-      for (let k = 0; k < seg.length - 1; k++) {
-        const p0 = seg[Math.max(0, k - 1)], p1 = seg[k], p2 = seg[k + 1], p3 = seg[Math.min(seg.length - 1, k + 2)];
-        for (let s = 1; s <= subdiv; s++) {
-          const t = s / subdiv;
-          const t2 = t * t, t3 = t2 * t;
-          out.push(p1.map((_, d) => 0.5 * ((2 * p1[d]) + (-p0[d] + p2[d]) * t + (2 * p0[d] - 5 * p1[d] + 4 * p2[d] - p3[d]) * t2 + (-p0[d] + 3 * p1[d] - 3 * p2[d] + p3[d]) * t3)));
-        }
+/**
+ * Decide the plan on the shared 3D chain. `window` (in edge lengths) is the
+ * arc distance used to measure turning; a real corner turns sharply even over
+ * several edges, a staircase does not.
+ */
+export function planSmoothing(chain: P[], cornerAngleDeg = 55, windowEdges = 3, passes = 2): SmoothPlan {
+  const n = chain.length;
+  if (n <= 2) return { corners: chain.map((_, i) => i), fractions: chain.length === 2 ? [[0, 1]] : [], passes: 0 };
+  const arc = cumulative(chain);
+  const L = arc[n - 1];
+  const edges: number[] = [];
+  for (let i = 1; i < n; i++) edges.push(arc[i] - arc[i - 1]);
+  const sorted = edges.slice().sort((a, b) => a - b);
+  const h = sorted[Math.floor(sorted.length / 2)] || L / (n - 1) || 1;
+  const w = windowEdges * h;
+  // corner candidates: DP-kept vertices; measure turning over ±w along the chain
+  const cand = simplifyIndices(chain, h);
+  const cosLimit = Math.cos((cornerAngleDeg * Math.PI) / 180);
+  const corners: Array<{ i: number; sharp: number }> = [];
+  for (const i of cand) {
+    if (i === 0 || i === n - 1) continue;
+    if (arc[i] < w * 0.6 || L - arc[i] < w * 0.6) continue;
+    const a = pointAt(chain, arc, arc[i] - w), b = pointAt(chain, arc, arc[i] + w);
+    const d1 = sub(chain[i], a), d2 = sub(b, chain[i]);
+    const l1 = len(d1), l2 = len(d2);
+    if (l1 < 1e-12 || l2 < 1e-12) continue;
+    const c = dot(d1, d2) / (l1 * l2);
+    if (c < cosLimit) corners.push({ i, sharp: -c });
+  }
+  // keep the sharpest of any corners closer than the window
+  corners.sort((x, y) => y.sharp - x.sharp);
+  const chosen: number[] = [];
+  for (const c of corners) if (chosen.every((j) => Math.abs(arc[j] - arc[c.i]) > w)) chosen.push(c.i);
+  chosen.push(0, n - 1);
+  chosen.sort((a, b) => a - b);
+  const fractions: number[][] = [];
+  for (let k = 0; k < chosen.length - 1; k++) {
+    const span = arc[chosen[k + 1]] - arc[chosen[k]];
+    const m = Math.max(1, Math.round(span / h));
+    const fr: number[] = [];
+    for (let s = 0; s <= m; s++) fr.push(s / m);
+    fractions.push(fr);
+  }
+  return { corners: chosen, fractions, passes };
+}
+
+/** Apply a plan to any polyline sampled at the same chain vertices (a 2D side or the 3D chain). */
+export function applySmoothing<T extends P>(pts: T[], plan: SmoothPlan): P[] {
+  if (pts.length < 2) return pts.map((p) => p.slice());
+  const out: P[] = [];
+  for (let k = 0; k < plan.corners.length - 1; k++) {
+    const i0 = plan.corners[k], i1 = plan.corners[k + 1];
+    const seg = pts.slice(i0, i1 + 1);
+    const arc = cumulative(seg);
+    const L = arc[arc.length - 1];
+    let samples = plan.fractions[k].map((f) => pointAt(seg, arc, f * L));
+    for (let pass = 0; pass < plan.passes; pass++) {
+      const next = samples.map((p) => p.slice());
+      for (let i = 1; i < samples.length - 1; i++) {
+        const pm2 = samples[Math.max(0, i - 2)], pm1 = samples[i - 1], p0 = samples[i], pp1 = samples[i + 1], pp2 = samples[Math.min(samples.length - 1, i + 2)];
+        next[i] = p0.map((_, d) => (pm2[d] + 4 * pm1[d] + 6 * p0[d] + 4 * pp1[d] + pp2[d]) / 16);
       }
+      samples = next;
     }
-    start = i;
+    if (k > 0) samples = samples.slice(1);
+    out.push(...samples);
   }
   return out;
-}
-
-export interface SmoothPlan {
-  keep: number[];
-  corners: boolean[];
-  subdiv: number;
-}
-
-/** Decide once (on the shared 3D chain) which points survive and where the corners are. */
-export function planSmoothing(chain: P[], cornerAngleDeg = 45, tolFactor = 0.75, subdiv = 4): SmoothPlan {
-  const n = chain.length;
-  if (n <= 2) return { keep: chain.map((_, i) => i), corners: chain.map(() => true), subdiv: 1 };
-  const lens: number[] = [];
-  for (let i = 1; i < n; i++) lens.push(len(sub(chain[i], chain[i - 1])));
-  const sorted = lens.slice().sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)] || 1;
-  const keep = simplifyIndices(chain, tolFactor * median);
-  const corners = cornerFlags(keep.map((i) => chain[i]), cornerAngleDeg);
-  return { keep, corners, subdiv };
-}
-
-/** Apply a plan to any polyline sampled at the same chain vertices (2D side or 3D chain). */
-export function applySmoothing<T extends P>(pts: T[], plan: SmoothPlan): P[] {
-  return splineThrough(plan.keep.map((i) => pts[i]), plan.corners, plan.subdiv);
 }
 
 export function polylineLength(pts: P[]): number {
   let L = 0;
   for (let i = 1; i < pts.length; i++) L += len(sub(pts[i], pts[i - 1]));
   return L;
+}
+
+/** Arc-length fractions (0..1) of each vertex of a polyline. */
+export function arcFractions(pts: P[]): number[] {
+  const arc = cumulative(pts);
+  const L = arc[arc.length - 1] || 1;
+  return arc.map((a) => a / L);
+}
+
+/** Point at a given arc fraction of a polyline. */
+export function pointAtFraction(pts: P[], f: number): P {
+  const arc = cumulative(pts);
+  return pointAt(pts, arc, f * arc[arc.length - 1]);
 }

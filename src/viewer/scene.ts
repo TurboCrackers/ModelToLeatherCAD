@@ -214,6 +214,11 @@ export class Viewer {
         this.pieceVerts[p].push(v);
       }
     }
+    // boundary vertices snapped onto the smooth seam curves (assembled/exploded states)
+    for (const pc of pattern.pieces) for (const [cv, q] of pc.boundaryDisplay) {
+      const d = explodeDir[pc.id];
+      for (let k = 0; k < 3; k++) { this.s0[3 * cv + k] = q[k]; this.s1[3 * cv + k] = q[k] + d[k] * explodeDist; }
+    }
     // mesh
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.BufferAttribute(this.cur, 3));
